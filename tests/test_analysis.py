@@ -314,6 +314,42 @@ class ExperimentAnalysisTests(unittest.TestCase):
         self.assertIn("320×240", filtered[0].mode_label)
         self.assertNotEqual(filtered[0].mode_label, "driver-reported 60 FPS")
 
+    def test_camera_family_browsing_keeps_distinct_identity_provenance(self) -> None:
+        legacy_camera = CameraIdentity(
+            "legacy:sony-playstation-eye:1415:2000", BackendKind.V4L2,
+            manufacturer="Sony", model="PlayStation Eye", vendor_id="1415",
+            product_id="2000", identity_source="inferred_from_legacy_path",
+        )
+        discovered_camera = CameraIdentity(
+            "/dev/v4l/by-id/usb-synthetic-ps3eye", BackendKind.V4L2,
+            manufacturer="Sony", model="PlayStation Eye", vendor_id="1415",
+            product_id="2000", identity_source="v4l_by_id",
+        )
+        legacy_id = self.database.upsert_camera(legacy_camera)
+        discovered_id = self.database.upsert_camera(discovered_camera)
+        pairs = []
+        for camera_id, label, source in (
+            (legacy_id, "Imported Eye", "imported"),
+            (discovered_id, "Native Eye", "live_experiment"),
+        ):
+            session = SessionRecord(camera_id=camera_id, label=label, source=source)
+            self.database.create_session(session)
+            benchmark = BenchmarkRecord(session_id=session.id, label="Synthetic mode", status="completed")
+            self.database.create_benchmark(benchmark)
+            pairs.append((session, benchmark))
+
+        options = list_experiments(self.database)
+        eye_options = [option for option in options if option.camera == "PlayStation Eye"]
+        self.assertEqual(len(eye_options), 2)
+        self.assertNotEqual(eye_options[0].camera_key, eye_options[1].camera_key)
+        self.assertEqual(eye_options[0].camera_group_key, eye_options[1].camera_group_key)
+        self.assertEqual(
+            {option.identity_source for option in eye_options},
+            {"inferred_from_legacy_path", "v4l_by_id"},
+        )
+        grouped = filter_experiments(options, camera_group_key="usb-family:1415:2000")
+        self.assertEqual({option.session_id for option in grouped}, {pair[0].id for pair in pairs})
+
     def test_requested_mode_filters_fall_back_to_setting_snapshots(self) -> None:
         session_id, benchmark_id = self._create_live_run(
             "Snapshot-only requested mode", [16.7], fps=60, reported_fps=59.9

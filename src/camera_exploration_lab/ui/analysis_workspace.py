@@ -6,7 +6,8 @@ import logging
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtCore import QEvent, QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -39,30 +40,117 @@ from ..analysis import (
     rate_deviation_percent,
 )
 from ..db import Database
+from .metrics_guide import MetricsGuideDialog
 
 logger = logging.getLogger(__name__)
 
 
+def contrast_ratio(foreground: QColor, background: QColor) -> float:
+    """WCAG contrast ratio for opaque sRGB colors."""
+    def luminance(color: QColor) -> float:
+        channels = [color.redF(), color.greenF(), color.blueF()]
+        linear = [channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+                  for channel in channels]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    first, second = sorted((luminance(foreground), luminance(background)), reverse=True)
+    return (first + 0.05) / (second + 0.05)
+
+
+class _RateAxisItem(pg.AxisItem):
+    """Format normalized FPS deviations as readable percentages."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.percent_mode = False
+        self.enableAutoSIPrefix(False)
+
+    def tickStrings(self, values, scale, spacing):  # noqa: N802 - pyqtgraph API
+        if not self.percent_mode:
+            return super().tickStrings(values, scale, spacing)
+        labels = []
+        for value in values:
+            absolute = abs(float(value))
+            if absolute < 0.01:
+                rendered = "0"
+            elif absolute < 1:
+                rendered = f"{value:.2f}"
+            elif absolute < 100:
+                rendered = f"{value:.1f}".rstrip("0").rstrip(".")
+            else:
+                rendered = f"{value:.0f}"
+            labels.append(f"{rendered}%")
+        return labels
+
+
 class _MetricCard(QFrame):
-    def __init__(self, title: str, tooltip: str, parent: QWidget | None = None) -> None:
+    help_requested = Signal(str)
+
+    def __init__(
+        self, title: str, tooltip: str, topic_key: str, parent: QWidget | None = None
+    ) -> None:
         super().__init__(parent)
+        self._updating_contrast = False
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setToolTip(tooltip)
+        self.topic_key = topic_key
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 7, 10, 7)
         layout.setSpacing(3)
+        title_row = QHBoxLayout()
         self.title = QLabel(title)
-        self.title.setStyleSheet("font-size: 11px; font-weight: 600; color: palette(mid);")
+        self.title.setTextFormat(Qt.TextFormat.PlainText)
         self.value = QLabel("—")
-        self.value.setStyleSheet("font-size: 18px; font-weight: 600;")
-        layout.addWidget(self.title)
+        self.help_button = QToolButton()
+        self.help_button.setText("?")
+        self.help_button.setAutoRaise(True)
+        self.help_button.setFixedSize(20, 20)
+        self.help_button.setToolTip(f"Explain {title}")
+        self.help_button.clicked.connect(self._request_help)
+        title_row.addWidget(self.title, 1)
+        title_row.addWidget(self.help_button, 0, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(title_row)
         layout.addWidget(self.value)
+        self._update_contrast()
+
+    def _request_help(self, _checked: bool = False) -> None:
+        self.help_requested.emit(self.topic_key)
+
+    def _update_contrast(self) -> None:
+        if self._updating_contrast:
+            return
+        self._updating_contrast = True
+        try:
+            palette = self.palette()
+            background = palette.color(QPalette.ColorRole.Button)
+            candidates = (
+                palette.color(QPalette.ColorRole.Text),
+                QColor("#ffffff"),
+                QColor("#000000"),
+            )
+            foreground = max(candidates, key=lambda color: contrast_ratio(color, background))
+            self.surface_color = background
+            self.foreground_color = foreground
+            self.setStyleSheet(f"QFrame {{ background-color: {background.name()}; }}")
+            self.title.setStyleSheet(
+                f"font-size: 11px; font-weight: 600; color: {foreground.name()};"
+            )
+            self.value.setStyleSheet(
+                f"font-size: 18px; font-weight: 600; color: {foreground.name()};"
+            )
+            self.help_button.setStyleSheet(f"color: {foreground.name()};")
+        finally:
+            self._updating_contrast = False
+
+    def changeEvent(self, event: QEvent) -> None:  # noqa: N802 - Qt API
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
+            self._update_contrast()
 
 
 class _TaskSignals(QObject):
-    completed = Signal(int, object)
+    completed = Signal(int, str, object)
     failed = Signal(int, str)
-    done = Signal(int)
 
 
 class _AnalysisTask(QRunnable):
@@ -71,6 +159,7 @@ class _AnalysisTask(QRunnable):
         request_id: int,
         operation: str,
         database: Database,
+        signals: _TaskSignals,
         primary: tuple[str | None, str] | None = None,
         comparison: tuple[str | None, str] | None = None,
     ) -> None:
@@ -78,10 +167,9 @@ class _AnalysisTask(QRunnable):
         self.request_id = request_id
         self.operation = operation
         self.database = database
+        self.signals = signals
         self.primary = primary
         self.comparison = comparison
-        self.signals = _TaskSignals()
-        self.setAutoDelete(False)
 
     def run(self) -> None:
         try:
@@ -97,12 +185,10 @@ class _AnalysisTask(QRunnable):
                     result = load_analysis(
                         self.database, self.primary[0], self.primary[1]
                     )
-            self.signals.completed.emit(self.request_id, result)
+            self.signals.completed.emit(self.request_id, self.operation, result)
         except Exception as exc:
             logger.exception("Analysis request failed")
             self.signals.failed.emit(self.request_id, str(exc))
-        finally:
-            self.signals.done.emit(self.request_id)
 
 
 class AnalysisWorkspace(QWidget):
@@ -114,13 +200,17 @@ class AnalysisWorkspace(QWidget):
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(2)
         self._request_id = 0
-        self._tasks: dict[int, _AnalysisTask] = {}
+        self._task_signals = _TaskSignals(self)
+        self._task_signals.completed.connect(self._task_completed)
+        self._task_signals.failed.connect(self._task_failed)
         self._options: list[ExperimentOption] = []
         self._pending_selection: tuple[str, str | None] | None = None
         self._primary: ExperimentAnalysis | None = None
         self._comparison: ExperimentAnalysis | None = None
         self._comparison_cleared = False
         self._updating_selectors = False
+        self._shutting_down = False
+        self._metrics_dialog: MetricsGuideDialog | None = None
         self._build_ui()
         self.refresh_experiments()
 
@@ -148,6 +238,8 @@ class AnalysisWorkspace(QWidget):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search experiment, date, camera, mode…")
         self.search_edit.setClearButtonEnabled(True)
+        self.metrics_guide_button = QPushButton("Metrics Guide")
+        self.metrics_guide_button.clicked.connect(self.open_metrics_guide)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_experiments)
         filters.addWidget(QLabel("Camera"))
@@ -157,6 +249,7 @@ class AnalysisWorkspace(QWidget):
         filters.addWidget(QLabel("Requested FPS"))
         filters.addWidget(self.fps_filter, 1)
         filters.addWidget(self.search_edit, 3)
+        filters.addWidget(self.metrics_guide_button)
         filters.addWidget(self.refresh_button)
         page_layout.addLayout(filters)
 
@@ -166,7 +259,9 @@ class AnalysisWorkspace(QWidget):
         self.session_a_combo.setToolTip("Session A; labels include experiment, camera, date, and status.")
         self.session_b_combo = QComboBox()
         self.session_b_combo.setMinimumWidth(230)
-        self.session_b_combo.setToolTip("Session B; another run from the same camera is preferred automatically.")
+        self.session_b_combo.setToolTip(
+            "Session B; the same stored camera identity is preferred, then another run in the same model family."
+        )
         self.experiment_combo = self.session_a_combo
         self.compare_combo = self.session_b_combo
         self.swap_button = QPushButton("Swap A / B")
@@ -218,17 +313,18 @@ class AnalysisWorkspace(QWidget):
         metrics.setSpacing(6)
         self.metric_cards: dict[str, _MetricCard] = {}
         definitions = (
-            ("capture_fps", "Capture FPS", "Observed delivered host frame-arrival rate."),
-            ("preview_fps", "Preview FPS", "GUI preview update cadence, separate from capture FPS."),
-            ("processing_fps", "Processing FPS", "Optional analysis processing rate, if recorded."),
-            ("frame_count", "Frame Count", "Recorded frame count when available."),
-            ("median", "Median Interval", "Median analyzed capture interval."),
-            ("p95", "p95 Interval", "95th percentile of analyzed capture intervals."),
-            ("p99", "p99 Interval", "99th percentile of analyzed capture intervals."),
-            ("failures", "Read Failures", "Capture read failures, when recorded by the source."),
+            ("capture_fps", "Capture FPS", "Observed delivered host frame-arrival rate.", "capture_fps"),
+            ("preview_fps", "Preview FPS", "GUI preview update cadence, separate from capture FPS.", "preview_fps"),
+            ("processing_fps", "Processing FPS", "Optional analysis processing rate, if recorded.", "processing_fps"),
+            ("frame_count", "Frame Count", "Recorded frame count when available.", "frame_count"),
+            ("median", "Median Interval", "Median analyzed capture interval.", "interval"),
+            ("p95", "p95 Interval", "95th percentile of analyzed capture intervals.", "percentiles"),
+            ("p99", "p99 Interval", "99th percentile of analyzed capture intervals.", "percentiles"),
+            ("failures", "Read Failures", "Capture read failures, when recorded by the source.", "read_failures"),
         )
-        for index, (key, title, tooltip) in enumerate(definitions):
-            card = _MetricCard(title, tooltip)
+        for index, (key, title, tooltip, topic_key) in enumerate(definitions):
+            card = _MetricCard(title, tooltip, topic_key)
+            card.help_requested.connect(self.open_metrics_guide)
             self.metric_cards[key] = card
             metrics.addWidget(card, index // 4, index % 4)
         page_layout.addLayout(metrics)
@@ -264,6 +360,10 @@ class AnalysisWorkspace(QWidget):
             "Requires recorder elapsed timestamps, matching stream scope, and matching timing method."
         )
         chart_options.addWidget(self.fps_deviation_checkbox)
+        self.interval_primary_checkbox = QCheckBox("Show Session A intervals")
+        self.interval_primary_checkbox.setChecked(True)
+        self.interval_primary_checkbox.setToolTip("Show or hide the primary interval trace without changing its stored measurements.")
+        chart_options.addWidget(self.interval_primary_checkbox)
         chart_options.addWidget(self.interval_overlay_checkbox)
         chart_options.addStretch(1)
         page_layout.addLayout(chart_options)
@@ -272,6 +372,7 @@ class AnalysisWorkspace(QWidget):
         self.fps_plot = self._make_plot(
             "Capture FPS vs elapsed time", "Capture FPS (frames/s)", "Recorder elapsed time (s)",
             "Windowed observed capture rate. Samples retain each run's recorded times; curves are not synchronized.",
+            percent_axis=True,
         )
         self.interval_plot = self._make_plot(
             "Capture interval timeline", "Frame interval (ms)", "Recorder elapsed time (s)",
@@ -335,6 +436,7 @@ class AnalysisWorkspace(QWidget):
         self.clear_comparison_button.clicked.connect(self._clear_comparison)
         self.details_toggle.toggled.connect(self._toggle_details)
         self.fps_deviation_checkbox.toggled.connect(self._redraw_comparison_curves)
+        self.interval_primary_checkbox.toggled.connect(self._redraw_comparison_curves)
         self.interval_overlay_checkbox.toggled.connect(self._redraw_comparison_curves)
 
     @staticmethod
@@ -358,8 +460,13 @@ class AnalysisWorkspace(QWidget):
         self.details_toggle.setText("Hide technical details" if expanded else "Show technical details")
 
     @staticmethod
-    def _make_plot(title: str, y_label: str, x_label: str, tooltip: str) -> pg.PlotWidget:
-        plot = pg.PlotWidget()
+    def _make_plot(
+        title: str, y_label: str, x_label: str, tooltip: str, *, percent_axis: bool = False
+    ) -> pg.PlotWidget:
+        axis = _RateAxisItem(orientation="left") if percent_axis else None
+        plot = pg.PlotWidget(axisItems={"left": axis} if axis is not None else None)
+        if percent_axis:
+            plot._cel_rate_axis = axis
         plot.setBackground(None)
         plot.showGrid(x=True, y=True, alpha=0.22)
         plot.setTitle(title)
@@ -369,10 +476,26 @@ class AnalysisWorkspace(QWidget):
         plot.setMinimumHeight(190)
         return plot
 
+    def open_metrics_guide(self, topic_key: str | None = None) -> None:
+        if self._metrics_dialog is None:
+            self._metrics_dialog = MetricsGuideDialog(topic_key, self)
+        else:
+            self._metrics_dialog.select_topic(topic_key)
+        dialog = self._metrics_dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def refresh_experiments(self) -> None:
+        if self._shutting_down:
+            return
         self.status_label.setStyleSheet("color: palette(mid);")
         self.status_label.setText("Reading saved experiment index…")
         self._submit("list")
+
+    def stop_background_work(self) -> None:
+        self._shutting_down = True
+        self._pool.waitForDone()
 
     def select_experiment(self, session_id: str, benchmark_id: str | None) -> None:
         """Select a History row and load it, even if the asynchronous index is pending."""
@@ -388,22 +511,19 @@ class AnalysisWorkspace(QWidget):
         primary: tuple[str | None, str] | None = None,
         comparison: tuple[str | None, str] | None = None,
     ) -> None:
+        if self._shutting_down:
+            return
         self._request_id += 1
         request_id = self._request_id
-        task = _AnalysisTask(request_id, operation, self._database, primary, comparison)
-        task.signals.completed.connect(self._task_completed)
-        task.signals.failed.connect(self._task_failed)
-        task.signals.done.connect(self._task_done)
-        self._tasks[request_id] = task
+        task = _AnalysisTask(
+            request_id, operation, self._database, self._task_signals, primary, comparison
+        )
         self._pool.start(task)
 
-    def _task_completed(self, request_id: int, result: object) -> None:
-        if request_id != self._request_id:
+    def _task_completed(self, request_id: int, operation: str, result: object) -> None:
+        if self._shutting_down or request_id != self._request_id:
             return
-        task = self._tasks.get(request_id)
-        if task is None:
-            return
-        if task.operation == "list":
+        if operation == "list":
             self._options = result if isinstance(result, list) else []
             self._populate_filter_choices()
             if not self._options:
@@ -429,12 +549,9 @@ class AnalysisWorkspace(QWidget):
             self._render(result[0], result[1])
 
     def _task_failed(self, request_id: int, message: str) -> None:
-        if request_id == self._request_id:
+        if not self._shutting_down and request_id == self._request_id:
             self.status_label.setText(f"Analysis could not be loaded: {message}")
             self.status_label.setStyleSheet("color: #a33;")
-
-    def _task_done(self, request_id: int) -> None:
-        self._tasks.pop(request_id, None)
 
     def _populate_filter_choices(self) -> None:
         camera_value = self.camera_filter.currentData()
@@ -444,15 +561,24 @@ class AnalysisWorkspace(QWidget):
             combo.blockSignals(True)
             combo.clear()
         self.camera_filter.addItem("All cameras", None)
-        camera_pairs = sorted({(o.camera_key, o.camera) for o in self._options}, key=lambda x: x[1].casefold())
-        seen_names: dict[str, int] = {}
-        for _key, name in camera_pairs:
-            seen_names[name] = seen_names.get(name, 0) + 1
-        name_counts: dict[str, int] = {}
-        for key, name in camera_pairs:
-            name_counts[name] = name_counts.get(name, 0) + 1
-            suffix = f" · unit {name_counts[name]}" if seen_names[name] > 1 else ""
-            self.camera_filter.addItem(name + suffix, key)
+        camera_families: dict[str, set[str]] = {}
+        camera_names: dict[str, str] = {}
+        for option in self._options:
+            family_key = option.camera_group_key or option.camera_key
+            camera_families.setdefault(family_key, set()).add(option.camera_key)
+            camera_names[family_key] = option.camera
+        for family_key in sorted(camera_families, key=lambda key: camera_names[key].casefold()):
+            name = camera_names[family_key]
+            identity_count = len(camera_families[family_key])
+            suffix = f" · {identity_count} recorded identity groups" if identity_count > 1 else ""
+            self.camera_filter.addItem(name + suffix, family_key)
+            if identity_count > 1:
+                self.camera_filter.setItemData(
+                    self.camera_filter.count() - 1,
+                    "This model-family filter includes separate imported and discovered identity records. "
+                    "They remain distinct; use the identity badges in the session selectors to review provenance.",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
         self.mode_filter.addItem("All modes", None)
         for mode in sorted({o.mode_label for o in self._options}, key=str.casefold):
             self.mode_filter.addItem(mode, mode)
@@ -499,7 +625,7 @@ class AnalysisWorkspace(QWidget):
         fps_value = self.fps_filter.currentData()
         options = filter_experiments(
             self._options,
-            camera_key=self.camera_filter.currentData(),
+            camera_group_key=self.camera_filter.currentData(),
             mode_label=self.mode_filter.currentData(),
             requested_fps=fps_value,
             search=self.search_edit.text(),
@@ -531,7 +657,16 @@ class AnalysisWorkspace(QWidget):
                 (i for i, o in enumerate(eligible, start=1) if o.camera_key == primary_option.camera_key),
                 -1,
             )
-            compare_index = same_camera if same_camera >= 0 else (1 if eligible else 0)
+            same_family = next(
+                (i for i, o in enumerate(eligible, start=1)
+                 if o.camera_group_key == primary_option.camera_group_key),
+                -1,
+            )
+            compare_index = (
+                same_camera if same_camera >= 0
+                else same_family if same_family >= 0
+                else (1 if eligible else 0)
+            )
         self.session_b_combo.setCurrentIndex(compare_index if compare_index >= 0 else 0)
         self._updating_selectors = False
         self.empty_state.setVisible(len(options) < 2)
@@ -615,8 +750,11 @@ class AnalysisWorkspace(QWidget):
         self.interval_plot.clear()
         plot = self.interval_plot.plotItem
         plot.setLabel("bottom", analysis.interval_x_label)
-        series = [(analysis, "#167d9a", "A")]
-        if self.interval_overlay_checkbox.isEnabled() and self.interval_overlay_checkbox.isChecked() and self._comparison:
+        series = []
+        if self.interval_primary_checkbox.isChecked():
+            series.append((analysis, "#167d9a", "A"))
+        if (self.interval_overlay_checkbox.isEnabled() and self.interval_overlay_checkbox.isChecked()
+                and self._comparison):
             series.append((self._comparison, "#b66518", "B"))
         if any(item.interval_points for item, _color, _side in series):
             plot.addLegend(offset=(10, 8))
@@ -626,7 +764,8 @@ class AnalysisWorkspace(QWidget):
             x_values, y_values = zip(*item.interval_points)
             line = plot.plot(
                 x_values, y_values,
-                pen=pg.mkPen(color, width=1.5, style=Qt.PenStyle.SolidLine if side == "A" else Qt.PenStyle.DashLine),
+                pen=pg.mkPen(color, width=1.25 if len(x_values) > 500 else 1.7,
+                             style=Qt.PenStyle.SolidLine if side == "A" else Qt.PenStyle.DashLine),
                 symbol=("o" if side == "A" else "t") if len(x_values) < 140 else None,
                 symbolSize=5,
                 name=f"Session {side} · {self._short_session(item)}",
@@ -652,6 +791,11 @@ class AnalysisWorkspace(QWidget):
         plot = self.fps_plot.plotItem
         plot.setTitle("Capture FPS comparison" if comparison else "Capture FPS over time")
         plot.setLabel("bottom", analysis.fps_x_label)
+        percent_axis = self.fps_plot.plotItem.getAxis("left")
+        if isinstance(percent_axis, _RateAxisItem):
+            percent_axis.percent_mode = self.fps_deviation_checkbox.isChecked()
+            percent_axis.picture = None
+            percent_axis.update()
         plot.setLabel("left", "Deviation from run mean (%)" if self.fps_deviation_checkbox.isChecked() else "Capture FPS (frames/s)")
         series = [(analysis, "#167d9a", "A")]
         if comparison is not None and self._can_compare_fps(analysis, comparison):
@@ -717,6 +861,7 @@ class AnalysisWorkspace(QWidget):
     ) -> list[tuple[str, str, str, str]]:
         rows: list[tuple[str, str, str, str]] = [
             ("Camera model", left.option.camera, right.option.camera, ""),
+            ("Stored identity source", _identity_text(left.option), _identity_text(right.option), ""),
             ("Capture mode", _mode_text(left), _mode_text(right), ""),
             ("Requested FPS", _requested_fps_text(left), _requested_fps_text(right), ""),
             ("Driver-reported FPS", _driver_fps_text(left), _driver_fps_text(right), ""),
@@ -833,7 +978,8 @@ class AnalysisWorkspace(QWidget):
     def _render_detail_text(self, analysis: ExperimentAnalysis) -> None:
         lines = [
             f"Experiment: {analysis.option.label}",
-            f"Camera: {analysis.option.camera} · source: {analysis.option.source} · status: {analysis.saved_status}",
+            f"Camera: {analysis.option.camera} · identity: {analysis.option.identity_badge or 'unavailable'}",
+            f"Record source: {analysis.option.source} · status: {analysis.saved_status}",
             f"Started: {analysis.option.started_at or 'not recorded'}",
             f"Duration: {_format_duration(analysis.duration_seconds)} ({analysis.duration_source or 'source unavailable'})",
             f"Requested capture settings: {_settings_text(analysis.requested_settings)}",
@@ -924,7 +1070,8 @@ class AnalysisWorkspace(QWidget):
     @staticmethod
     def _option_label(option: ExperimentOption) -> str:
         date = option.started_at or "date unavailable"
-        return f"{option.label} · {option.camera} · {option.mode_label} · {date} · {option.status}"
+        identity = f" · {option.identity_badge}" if option.identity_badge else ""
+        return f"{option.label} · {option.camera}{identity} · {option.mode_label} · {date} · {option.status}"
 
     @staticmethod
     def _combo_identity(combo: QComboBox) -> tuple[str, str | None] | None:
@@ -962,6 +1109,10 @@ class AnalysisWorkspace(QWidget):
 
 def _mode_text(analysis: ExperimentAnalysis) -> str:
     return analysis.option.mode_label
+
+
+def _identity_text(option: ExperimentOption) -> str:
+    return option.identity_badge or "Identity provenance unavailable"
 
 
 def _requested_fps_text(analysis: ExperimentAnalysis) -> str:

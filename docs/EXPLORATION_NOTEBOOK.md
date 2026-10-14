@@ -20,7 +20,7 @@ The original private development history contains three completed milestones. Th
 | Phase 0 — Foundation | SQLite schema, camera discovery model, historical CSV importer, session data model, logging, and camera-independent tests. | Automated tests use synthetic records and temporary databases. |
 | Phase 1 — Live Workbench | Preview-first PySide6 workbench, independent capture and preview loops, persistent metric labels, and V4L2 mode/readback display. | Mocked tests and host capture checks with two native USB cameras. |
 | Phase 2A — Experiment recording | Timed and manual sessions, notes, bounded streaming timing storage, SQLite summaries, and a basic History view. | Automated tests passed; a completed physical recording was inspected in History. Detailed run values remain in the local database. |
-| Phase 2B — Experiment analysis | Read-only Analysis dashboard with camera/mode/rate filters, Session A/B comparison, timing curves, interval distributions, and summary cards. | Synthetic tests cover timing math, filters, imported/interrupted records, bounded plots, query-only reads, and History navigation; follow-up visual review is requested for the dashboard refinements. |
+| Phase 2B — Experiment analysis | Read-only Analysis dashboard, model-family browsing with provenance-preserving identities, searchable History, comparison curves, and contextual Metrics Guide. | Synthetic tests cover timing math, dark/light card contrast, filters, imported/interrupted records, bounded plots, query-only reads, Help topics, and History navigation; final Bazzite visual review is requested. |
 
 ## Confirmed discoveries and design decisions
 
@@ -34,6 +34,7 @@ The original private development history contains three completed milestones. Th
 | Exclude only an importer-marked first CSV interval of `0.000 ms` from derived statistics when it has no preceding frame; preserve its raw source row. | The source value is a recording-boundary marker, not an elapsed frame interval. Other zero values remain in calculations and are reported separately from positive log-histogram bins. |
 | Analyze history through a query-only connection and stream plot samples into min/max buckets. | Analysis must not alter research data, freeze the UI, or erase timing spikes during visual downsampling. |
 | Use V4L2 `Device Caps` when the driver advertises per-node capabilities. | A single physical UVC camera can expose both image capture and metadata-only nodes; the broader capability mask is not specific to each node. |
+| Group cameras by model family for browsing without merging their stored identity records. | Imported legacy identities and discovered stable endpoints may represent different levels of evidence; matching names or USB product IDs alone do not prove the same physical unit. |
 | Overlay capture-rate curves only when both recordings have recorder elapsed timestamps; never interpolate missing samples. | Curves retain each separate session's timing basis, duration, and sampling density. Separate runs are not simultaneous measurements. |
 | Show imported summary fields as stored values when raw intervals are absent. | Legacy history does not always support recalculating a complete distribution. |
 | Treat local databases and logs as user data. | They can contain camera identity, paths, experiment names, notes, and imported records. |
@@ -44,7 +45,7 @@ The original private development history contains three completed milestones. Th
 | ID | Idea | Area | Status | Next evidence needed |
 | --- | --- | --- | --- | --- |
 | CEL-001 | Harden recording across manual stop, disconnect/reconnect, and restart recovery. | Core | Implemented; more physical cases pending | Compare visible status with persisted session state for each case. |
-| CEL-013 | Record concurrent multi-camera experiments with per-camera timing and failure state. | Core (future) | High-priority upcoming milestone | Validate independent stream delivery, per-camera configuration, host-arrival timing, and interruption behavior; do not imply hardware synchronization. |
+| CEL-013 | Build the Multi-Camera Workbench and record concurrent experiments with per-camera timing and failure state. | Core (future) | Immediate next major functional milestone | Validate independent stream delivery, per-camera configuration, host-arrival timing, and interruption behavior; do not imply hardware synchronization. |
 | CEL-002 | Add graphs, comparisons, and annotated exports. | Core | Analysis and comparison implemented in Phase 2B; exports planned | Visually review saved and imported runs on Bazzite; later define exports that preserve raw timestamps and units. |
 | CEL-003 | Add capability-driven exposure and gain controls with readback. | Core | Planned | Probe supported ranges and verify safe failure and restart behavior per device. |
 | CEL-004 | Compare camera modes and controlled environmental conditions. | Research | Proposed | Repeat runs with recorded lighting, exposure, focus, and lens position. |
@@ -67,6 +68,14 @@ The original private development history contains three completed milestones. Th
 - Evidence: source review and read-only inspection of local imported history found `0.000 ms` values at the first interval row of imported runs. Those source rows remain intact; only that importer-marked first-row boundary value is excluded from derived interval statistics because it has no preceding frame. Synthetic tests cover preservation and the exclusion rule.
 - Limitations: these changes do not measure sensor latency, synchronize separate recordings, or infer absent timing samples. Visual review of the revised dashboard remains pending.
 - Follow-up: complete owner review, then keep CEL-013 Multi-Camera Experiment Recording as the next functional milestone.
+
+### 2026-10-14 — History identity provenance, search, and measurement help
+
+- Kind: finding and decision
+- Context: the Analysis camera filter showed PlayStation Eye unit 1 and unit 2 even though only one physical camera was connected.
+- Finding or choice: read-only inspection found two stored camera rows with different identity provenance: the legacy CSV importer infers a key from the source path/profile, while native sessions use the discovered V4L2 by-id endpoint. The imported row has no serial-number evidence. These are identity groups in the history model, not evidence of two physical cameras. The application groups matching USB vendor/product models for browsing but keeps the original identities separate and labels their source and opaque fingerprint.
+- Evidence: importer and discovery source review plus query-only inspection of the existing database; no records or schema were changed. Synthetic tests cover same-family/different-provenance grouping.
+- Follow-up: owner visually review contrast, search and selection behavior, comparison overlays, and Metrics Guide on Bazzite; keep CEL-013 Multi-Camera Workbench as the next major functional milestone.
 
 ### 2026-10-13 — PS3 Eye and AVerMedia concurrent delivery
 
@@ -101,6 +110,10 @@ Screen-interaction research should begin with 2D mapping from a known plane. Add
 ## Separate wardrobe application concept
 
 A private-first wardrobe catalog could support garment photos, editable categories and attributes, search, outfit combinations, and an optional wear log. A useful first flow is capture or import → review/crop → suggest labels → user correction → local catalog. Photos, purchase details, and wear history belong in the separate app's own private storage, not in Lab code or fixtures.
+
+## Related project review
+
+The Lab's intended overlap and complementary scope with established Linux camera, V4L2, multi-camera, latency, and calibration projects is summarized in [Related Projects](RELATED_PROJECTS.md). The current scope is reproducible camera experiments and trustworthy host-timing analysis; specialized controls and computer-vision work remain optional or external.
 
 ## Privacy and publication decisions
 

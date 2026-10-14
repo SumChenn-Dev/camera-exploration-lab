@@ -613,15 +613,21 @@ class Database:
         return recovered
 
     def history_entries(self) -> list[dict[str, object]]:
-        with self.connect() as connection:
+        """List history through a query-only connection; filtering never writes data."""
+        with self.connect_readonly() as connection:
             rows = connection.execute(
                 """SELECT s.id AS session_id, b.id AS benchmark_id, s.label AS session_label,
                           s.source, s.started_at AS session_started_at, s.ended_at AS session_ended_at,
                           s.notes, s.metadata_json AS session_metadata_json,
                           b.label AS benchmark_label, b.started_at AS benchmark_started_at,
                           b.ended_at AS benchmark_ended_at, b.status, b.configuration_json,
-                          c.stable_identifier, c.model, c.manufacturer,
+                          c.id AS camera_id, c.stable_identifier, c.identity_source,
+                          c.vendor_id, c.product_id, c.model, c.manufacturer,
                           i.source_basename,
+                          (SELECT GROUP_CONCAT(
+                               setting_key || ' ' || COALESCE(requested_value_json, '') || ' ' ||
+                               COALESCE(reported_value_json, ''), ' ')
+                           FROM setting_snapshots ss WHERE ss.benchmark_id=b.id) AS setting_search_text,
                           z.frame_count, z.read_failures, z.duration_seconds,
                           COALESCE(z.capture_fps, (SELECT AVG(m.value) FROM measurements m
                               WHERE m.benchmark_id=b.id AND m.metric='capture_fps' AND m.stream_scope='capture')) AS capture_fps,
@@ -639,12 +645,13 @@ class Database:
         return [dict(row) for row in rows]
 
     def history_detail(self, benchmark_id: str | None, session_id: str) -> dict[str, object]:
-        with self.connect() as connection:
+        with self.connect_readonly() as connection:
             if benchmark_id:
                 entry = connection.execute(
                     """SELECT s.*, b.id AS benchmark_id, b.label AS benchmark_label,
                               b.started_at AS benchmark_started_at, b.ended_at AS benchmark_ended_at,
-                              b.status, b.configuration_json, c.stable_identifier, c.model, c.manufacturer,
+                              b.status, b.configuration_json, c.stable_identifier, c.identity_source,
+                              c.vendor_id, c.product_id, c.model, c.manufacturer,
                               i.source_basename, i.row_count AS imported_row_count,
                               i.measurement_count AS imported_measurement_count,
                               z.frame_count, z.read_failures, z.duration_seconds, z.capture_fps,
@@ -662,7 +669,7 @@ class Database:
                     """SELECT s.*, NULL AS benchmark_id, NULL AS benchmark_label,
                               NULL AS benchmark_started_at, NULL AS benchmark_ended_at,
                               NULL AS status, NULL AS configuration_json, c.stable_identifier,
-                              c.model, c.manufacturer, i.source_basename,
+                              c.identity_source, c.vendor_id, c.product_id, c.model, c.manufacturer, i.source_basename,
                               i.row_count AS imported_row_count, i.measurement_count AS imported_measurement_count,
                               NULL AS frame_count, NULL AS read_failures, NULL AS duration_seconds,
                               NULL AS capture_fps, NULL AS preview_fps, NULL AS processing_fps,

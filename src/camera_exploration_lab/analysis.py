@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Iterable
 
 from .db import Database
+from .identity import camera_family_key, identity_fingerprint, identity_source_label
 
 DEFAULT_MAX_PLOT_POINTS = 2400
 FPS_WINDOW_SECONDS = 1.0
@@ -32,6 +33,9 @@ class ExperimentOption:
     camera_key: str = ""
     mode_label: str = "Mode unavailable"
     requested_fps: float | None = None
+    camera_group_key: str = ""
+    identity_source: str = ""
+    identity_badge: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +107,8 @@ def list_experiments(database: Database) -> list[ExperimentOption]:
             """SELECT s.id AS session_id, b.id AS benchmark_id, s.label AS session_label,
                       s.source, b.label AS benchmark_label, b.status,
                       b.started_at AS benchmark_started_at, s.started_at AS session_started_at,
-                      c.id AS camera_id, c.stable_identifier, c.model, c.manufacturer,
+                      c.id AS camera_id, c.stable_identifier, c.identity_source,
+                      c.vendor_id, c.product_id, c.model, c.manufacturer,
                       b.configuration_json
                FROM sessions s
                LEFT JOIN benchmark_runs b ON b.session_id=s.id
@@ -141,6 +146,9 @@ def list_experiments(database: Database) -> list[ExperimentOption]:
             requested.setdefault(key, value)
         for key, value in snapshot_reported.items():
             reported.setdefault(key, value)
+        stored_identity = str(
+            row["stable_identifier"] or row["camera_id"] or _camera_key_fallback(camera)
+        )
         options.append(ExperimentOption(
             session_id=str(row["session_id"]),
             benchmark_id=str(row["benchmark_id"]) if row["benchmark_id"] else None,
@@ -149,11 +157,18 @@ def list_experiments(database: Database) -> list[ExperimentOption]:
             source=source,
             status=str(row["status"] or ("imported" if source == "imported" else "session")),
             started_at=row["benchmark_started_at"] or row["session_started_at"],
-            camera_key=str(
-                row["stable_identifier"] or row["camera_id"] or _camera_key_fallback(camera)
-            ),
+            camera_key=stored_identity,
             mode_label=_mode_filter_label(requested, reported, configuration_note),
             requested_fps=_requested_fps(requested),
+            camera_group_key=camera_family_key(
+                row["vendor_id"], row["product_id"], row["manufacturer"], row["model"],
+                stored_identity,
+            ),
+            identity_source=str(row["identity_source"] or ""),
+            identity_badge=(
+                f"{identity_source_label(row['identity_source'])} · "
+                f"{identity_fingerprint(row['stable_identifier'] or row['camera_id'])}"
+            ),
         ))
     return options
 
@@ -162,6 +177,7 @@ def filter_experiments(
     options: Iterable[ExperimentOption],
     *,
     camera_key: str | None = None,
+    camera_group_key: str | None = None,
     mode_label: str | None = None,
     requested_fps: float | None = None,
     search: str = "",
@@ -171,6 +187,8 @@ def filter_experiments(
     result = []
     for option in options:
         if camera_key and option.camera_key != camera_key:
+            continue
+        if camera_group_key and option.camera_group_key != camera_group_key:
             continue
         if mode_label and option.mode_label != mode_label:
             continue
@@ -289,7 +307,8 @@ def _load_analysis(
                       z.frame_count, z.read_failures, z.duration_seconds,
                       z.capture_fps, z.preview_fps, z.processing_fps, z.interval_count,
                       z.median_interval_ms, z.p95_interval_ms, z.p99_interval_ms, z.summary_json,
-                      c.id AS camera_id, c.stable_identifier
+                      c.id AS camera_id, c.stable_identifier, c.identity_source,
+                      c.vendor_id, c.product_id
                FROM sessions s JOIN benchmark_runs b ON b.session_id=s.id
                LEFT JOIN cameras c ON c.id=s.camera_id
                LEFT JOIN benchmark_summaries z ON z.benchmark_id=b.id
@@ -307,7 +326,8 @@ def _load_analysis(
                       NULL AS capture_fps, NULL AS preview_fps, NULL AS processing_fps,
                       NULL AS interval_count, NULL AS median_interval_ms, NULL AS p95_interval_ms,
                       NULL AS p99_interval_ms, NULL AS summary_json,
-                      c.id AS camera_id, c.stable_identifier
+                      c.id AS camera_id, c.stable_identifier, c.identity_source,
+                      c.vendor_id, c.product_id
                FROM sessions s LEFT JOIN cameras c ON c.id=s.camera_id WHERE s.id=?""",
             (session_id,),
         ).fetchone()
@@ -346,6 +366,15 @@ def _load_analysis(
         camera_key=str(row["stable_identifier"] or row["camera_id"] or _camera_key_fallback(camera)),
         mode_label=_mode_filter_label(requested, reported, configuration_note),
         requested_fps=_requested_fps(requested),
+        camera_group_key=camera_family_key(
+            row["vendor_id"], row["product_id"], row["manufacturer"], row["model"],
+            str(row["stable_identifier"] or row["camera_id"] or _camera_key_fallback(camera)),
+        ),
+        identity_source=str(row["identity_source"] or ""),
+        identity_badge=(
+            f"{identity_source_label(row['identity_source'])} · "
+            f"{identity_fingerprint(row['stable_identifier'] or row['camera_id'])}"
+        ),
     )
 
     summary = _json_object(row["summary_json"])

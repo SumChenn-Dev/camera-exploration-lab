@@ -16,6 +16,7 @@ PySide6 desktop shell
           ├── independent capture / preview / processing stages
           ├── bounded experiment recorder
           ├── asynchronous experiment analysis
+          ├── asynchronous searchable History model
           └── SQLite repository and CSV importer
 ```
 
@@ -70,7 +71,9 @@ The local database can contain camera serial numbers, machine-specific source pa
 
 ## Historical analysis
 
-The Analysis workspace reads the existing schema version 2 through a SQLite URI opened in read-only mode with query-only enabled. It does not initialize or migrate the database, and Phase 2B adds no schema changes. A dedicated Qt worker performs the queries so larger histories do not block the event loop. The experiment index includes camera identity, requested capture mode, and requested FPS for filters. Search narrows readable experiment labels. Session A and Session B default to different runs from the same camera when available; filters can be cleared for cross-camera comparisons. History opens the exact selected run as Session A.
+The Analysis workspace reads the existing schema version 2 through a SQLite URI opened in read-only mode with query-only enabled. It does not initialize or migrate the database, and the Phase 2B follow-up adds no schema changes. A dedicated Qt worker performs the queries so larger histories do not block the event loop. Camera-family filters use USB vendor/product IDs when known, with normalized model names as a fallback; these keys are for browsing only and never update or merge stored identities. The exact camera key, identity source, and an opaque short fingerprint remain visible in selectors and technical details. Session A and Session B default to different runs from the same family when available; cross-camera comparison remains available.
+
+History uses a Qt table model and sort/filter proxy. It searches the session label, camera model, record source, notes, capture configuration and settings, requested FPS, date, and status. Search is debounced in the UI; history indexing and selected-record detail queries use background workers and query-only database connections. The Analyze selected action maps the current sorted/filtered row back to its source model record and opens that exact session. Filtering and sorting are in-memory presentation operations and do not change historical records.
 
 The interval timeline uses persisted capture-scoped frame_interval_ms values, falling back to interval nanoseconds on frame_arrival rows when needed. When recorder elapsed values are present they supply the horizontal coordinate; otherwise the chart uses cumulative persisted intervals and says so on the axis. The first interval can be absent when recording began during preview because its earlier endpoint may be outside the experiment boundary.
 
@@ -83,6 +86,14 @@ Chart data is streamed from SQLite and reduced to per-bucket minima and maxima, 
 For imported legacy CSV data, a zero interval in the first interval row with method `legacy_csv:interval_ms` is treated as a boundary marker: no earlier frame exists for that row. The normalized measurement and original raw CSV row remain in SQLite, while that one marker is excluded from derived interval statistics and FPS calculations. Other zero values, including live-recorded zeros, remain part of calculations and are reported separately from positive histogram bins. No database schema change is required.
 
 The Analysis page uses a vertical scroll area and adjustable plot splitters. Metric cards stay compact; driver details, timing methods, timestamp scope, interval exclusions, and notes are expanded on demand. Short plot titles and abbreviated comparison headers avoid clipping, with tooltips and horizontal table scrolling for full labels.
+
+Metric cards select foreground text against the current Qt button-surface palette and choose a foreground with at least 4.5:1 contrast when the standard black/white candidates allow it. Their contextual help buttons open the Metrics Guide at the relevant topic; the full guide is also available from both Analysis and History. The guide labels each example as synthetic and explains units, interpretation, misunderstandings, and the formula or measurement method. Its latency guidance explicitly excludes OpenCV read durations and frame intervals as sensor-latency measurements.
+
+### Historical camera identity groups
+
+Read-only inspection of the local history showed two PlayStation Eye camera rows for two different provenance paths. Imported legacy CSVs use an identity inferred from the source path and legacy camera profile, while native V4L2 recordings use the discovered `/dev/v4l/by-id` stable endpoint. The legacy row has no serial-number evidence, so equal model names or USB IDs do not prove that both identity records refer to the same physical unit. No records were merged. The interface groups these records into one model family for browsing by shared USB vendor/product IDs, while source labels and opaque fingerprints keep the two stored identity groups distinguishable. Users can compare across the family without the application asserting physical-unit equivalence.
+
+See [Related Projects](docs/RELATED_PROJECTS.md) for reviewed neighboring tools, areas of overlap, and potential interoperability points. Specialized calibration, camera control, latency testing, astronomy analysis, and computer-vision workflows remain outside the core dependency surface unless added behind optional extension boundaries.
 
 ## Bazzite packaging and launch
 

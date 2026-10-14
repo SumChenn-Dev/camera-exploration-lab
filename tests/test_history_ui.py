@@ -89,9 +89,15 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.database = Database(Path(self.tempdir.name) / "ui-history.sqlite3")
         self.database.initialize()
+        self._windows: list[LiveWorkbenchWindow] = []
         self.application.processEvents()
 
     def tearDown(self) -> None:
+        for window in self._windows:
+            window.close()
+            window.history_workspace.pool.waitForDone()
+            window.analysis_workspace._pool.waitForDone()
+        self.application.processEvents()
         self.database.close()
         self.tempdir.cleanup()
 
@@ -110,6 +116,7 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             SyntheticDiscovery(), self.database,
             capture_factory=lambda _device: FakeCapture(),
         )
+        self._windows.append(window)
         window.camera_combo.setCurrentIndex(0)
         window.start_capture()
         self.assertTrue(self._process_until(
@@ -161,10 +168,11 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             self.database,
             capture_factory=lambda _device: fake_capture,
         )
+        self._windows.append(window)
         window.show()
         window.refresh_history()
-        self.assertEqual(window.history_table.rowCount(), 1)
-        self.assertIn("Imported: ps-eye.csv", window.history_details.toPlainText())
+        self.assertTrue(self._process_until(lambda: window.history_workspace.proxy.rowCount() == 1))
+        self.assertTrue(self._process_until(lambda: "Imported: ps-eye.csv" in window.history_details.toPlainText()))
 
         window.camera_combo.setCurrentIndex(0)
         window.experiment_name.setText("Synthetic preview independence")
@@ -188,8 +196,8 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
         self.assertTrue(window._worker.is_alive())
 
         window.stop_recording()
-        self.assertEqual(window.history_table.rowCount(), 2)
-        labels = [window.history_table.item(row, 0).text() for row in range(window.history_table.rowCount())]
+        self.assertTrue(self._process_until(lambda: window.history_workspace.proxy.rowCount() == 2))
+        labels = [window.history_workspace.proxy.index(row, 0).data() for row in range(window.history_workspace.proxy.rowCount())]
         self.assertTrue(any("Synthetic preview independence" in label for label in labels))
         with self.database.connect() as connection:
             live_run = connection.execute(
@@ -225,6 +233,7 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             SyntheticDiscovery(), self.database,
             capture_factory=lambda _device: fake_capture,
         )
+        self._windows.append(window)
         window.camera_combo.setCurrentIndex(0)
         window.experiment_name.setText("Mock disconnect")
         window.duration_combo.setCurrentIndex(window.duration_combo.count() - 1)
@@ -264,6 +273,7 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             SyntheticDiscovery(), self.database,
             capture_factory=lambda _device: fake_capture,
         )
+        self._windows.append(window)
         window.camera_combo.setCurrentIndex(0)
         window.experiment_name.setText("Must not start")
         window.start_capture()
@@ -312,8 +322,9 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             ),
         ])
         window = LiveWorkbenchWindow(SyntheticDiscovery(), self.database)
+        self._windows.append(window)
         window.refresh_history()
-        self.assertEqual(window.history_table.rowCount(), 1)
+        self.assertTrue(self._process_until(lambda: window.history_workspace.proxy.rowCount() == 1))
         window.history_table.selectRow(0)
         window.analyze_history_button.click()
 

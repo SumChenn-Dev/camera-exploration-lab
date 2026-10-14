@@ -29,6 +29,9 @@ class ExperimentOption:
     source: str
     status: str
     started_at: str | None
+    camera_key: str = ""
+    mode_label: str = "Mode unavailable"
+    requested_fps: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,7 @@ class Histogram:
     centers_ms: tuple[float, ...] = ()
     fractions: tuple[float, ...] = ()
     positive_sample_count: int = 0
+    zero_sample_count: int = 0
     underflow_count: int = 0
     overflow_count: int = 0
 
@@ -83,6 +87,7 @@ class ExperimentAnalysis:
     saved_status: str
     termination_reason: str | None
     interval_data_available: bool
+    interval_boundary_samples_excluded: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,12 +103,27 @@ def list_experiments(database: Database) -> list[ExperimentOption]:
             """SELECT s.id AS session_id, b.id AS benchmark_id, s.label AS session_label,
                       s.source, b.label AS benchmark_label, b.status,
                       b.started_at AS benchmark_started_at, s.started_at AS session_started_at,
-                      c.model, c.manufacturer
+                      c.id AS camera_id, c.stable_identifier, c.model, c.manufacturer,
+                      b.configuration_json
                FROM sessions s
                LEFT JOIN benchmark_runs b ON b.session_id=s.id
                LEFT JOIN cameras c ON c.id=s.camera_id
                ORDER BY COALESCE(b.started_at, s.started_at, s.created_at) DESC, b.id"""
         ).fetchall()
+        setting_rows = connection.execute(
+            """SELECT benchmark_id, setting_key, requested_value_json, reported_value_json
+               FROM setting_snapshots WHERE benchmark_id IS NOT NULL ORDER BY setting_key"""
+        ).fetchall()
+    settings_by_benchmark: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for setting in setting_rows:
+        requested_settings, reported_settings = settings_by_benchmark.setdefault(
+            str(setting["benchmark_id"]), ({}, {})
+        )
+        key = str(setting["setting_key"])
+        if setting["requested_value_json"] is not None:
+            requested_settings.setdefault(key, _json_value(setting["requested_value_json"]))
+        if setting["reported_value_json"] is not None:
+            reported_settings.setdefault(key, _json_value(setting["reported_value_json"]))
     options: list[ExperimentOption] = []
     for row in rows:
         source = str(row["source"] or "unknown")
@@ -112,6 +132,15 @@ def list_experiments(database: Database) -> list[ExperimentOption]:
         if benchmark_label and benchmark_label != label:
             label = f"{label} · {benchmark_label}"
         camera = row["model"] or row["manufacturer"] or "Camera identity unavailable"
+        configuration = _json_object(row["configuration_json"])
+        requested, reported, configuration_note = _capture_configuration(configuration)
+        snapshot_requested, snapshot_reported = settings_by_benchmark.get(
+            str(row["benchmark_id"]), ({}, {})
+        )
+        for key, value in snapshot_requested.items():
+            requested.setdefault(key, value)
+        for key, value in snapshot_reported.items():
+            reported.setdefault(key, value)
         options.append(ExperimentOption(
             session_id=str(row["session_id"]),
             benchmark_id=str(row["benchmark_id"]) if row["benchmark_id"] else None,
@@ -120,8 +149,54 @@ def list_experiments(database: Database) -> list[ExperimentOption]:
             source=source,
             status=str(row["status"] or ("imported" if source == "imported" else "session")),
             started_at=row["benchmark_started_at"] or row["session_started_at"],
+            camera_key=str(
+                row["stable_identifier"] or row["camera_id"] or _camera_key_fallback(camera)
+            ),
+            mode_label=_mode_filter_label(requested, reported, configuration_note),
+            requested_fps=_requested_fps(requested),
         ))
     return options
+
+
+def filter_experiments(
+    options: Iterable[ExperimentOption],
+    *,
+    camera_key: str | None = None,
+    mode_label: str | None = None,
+    requested_fps: float | None = None,
+    search: str = "",
+) -> list[ExperimentOption]:
+    """Filter saved runs using recorded camera identity and requested mode only."""
+    needle = search.strip().casefold()
+    result = []
+    for option in options:
+        if camera_key and option.camera_key != camera_key:
+            continue
+        if mode_label and option.mode_label != mode_label:
+            continue
+        if requested_fps is not None and option.requested_fps != requested_fps:
+            continue
+        searchable = " ".join((
+            option.label,
+            option.camera,
+            option.mode_label,
+            option.source,
+            option.status,
+            option.started_at or "",
+        )).casefold()
+        if needle and needle not in searchable:
+            continue
+        result.append(option)
+    return result
+
+
+def rate_deviation_percent(
+    points: Iterable[tuple[float, float]], mean_fps: float | None
+) -> tuple[tuple[float, float], ...]:
+    """Map recorded FPS points to deviation from the session-wide observed mean."""
+    if mean_fps is None or not math.isfinite(mean_fps) or mean_fps <= 0:
+        return ()
+    return tuple((elapsed, (fps / mean_fps - 1.0) * 100.0) for elapsed, fps in points)
 
 
 def load_analysis(
@@ -213,7 +288,8 @@ def _load_analysis(
                       b.configuration_json, c.model, c.manufacturer,
                       z.frame_count, z.read_failures, z.duration_seconds,
                       z.capture_fps, z.preview_fps, z.processing_fps, z.interval_count,
-                      z.median_interval_ms, z.p95_interval_ms, z.p99_interval_ms, z.summary_json
+                      z.median_interval_ms, z.p95_interval_ms, z.p99_interval_ms, z.summary_json,
+                      c.id AS camera_id, c.stable_identifier
                FROM sessions s JOIN benchmark_runs b ON b.session_id=s.id
                LEFT JOIN cameras c ON c.id=s.camera_id
                LEFT JOIN benchmark_summaries z ON z.benchmark_id=b.id
@@ -230,7 +306,8 @@ def _load_analysis(
                       NULL AS frame_count, NULL AS read_failures, NULL AS duration_seconds,
                       NULL AS capture_fps, NULL AS preview_fps, NULL AS processing_fps,
                       NULL AS interval_count, NULL AS median_interval_ms, NULL AS p95_interval_ms,
-                      NULL AS p99_interval_ms, NULL AS summary_json
+                      NULL AS p99_interval_ms, NULL AS summary_json,
+                      c.id AS camera_id, c.stable_identifier
                FROM sessions s LEFT JOIN cameras c ON c.id=s.camera_id WHERE s.id=?""",
             (session_id,),
         ).fetchone()
@@ -241,18 +318,9 @@ def _load_analysis(
     label = str(row["session_label"] or "Unnamed experiment")
     if row["benchmark_label"] and row["benchmark_label"] != label:
         label = f"{label} · {row['benchmark_label']}"
-    option = ExperimentOption(
-        session_id=session_id,
-        benchmark_id=benchmark_id,
-        label=label,
-        camera=str(row["model"] or row["manufacturer"] or "Camera identity unavailable"),
-        source=source,
-        status=str(row["status"] or ("imported" if source == "imported" else "session")),
-        started_at=row["benchmark_started_at"] or row["session_started_at"],
+    requested, reported, configuration_note = _capture_configuration(
+        _json_object(row["configuration_json"])
     )
-
-    configuration = _json_object(row["configuration_json"])
-    requested, reported, configuration_note = _capture_configuration(configuration)
     if benchmark_id:
         setting_rows = connection.execute(
             """SELECT setting_key, requested_value_json, reported_value_json
@@ -265,6 +333,20 @@ def _load_analysis(
                 requested.setdefault(key, _json_value(setting["requested_value_json"]))
             if setting["reported_value_json"] is not None:
                 reported.setdefault(key, _json_value(setting["reported_value_json"]))
+
+    camera = str(row["model"] or row["manufacturer"] or "Camera identity unavailable")
+    option = ExperimentOption(
+        session_id=session_id,
+        benchmark_id=benchmark_id,
+        label=label,
+        camera=camera,
+        source=source,
+        status=str(row["status"] or ("imported" if source == "imported" else "session")),
+        started_at=row["benchmark_started_at"] or row["session_started_at"],
+        camera_key=str(row["stable_identifier"] or row["camera_id"] or _camera_key_fallback(camera)),
+        mode_label=_mode_filter_label(requested, reported, configuration_note),
+        requested_fps=_requested_fps(requested),
+    )
 
     summary = _json_object(row["summary_json"])
     termination_reason = summary.get("termination_reason")
@@ -282,6 +364,7 @@ def _load_analysis(
         interval_scope = None
         interval_method = None
         interval_data_available = False
+        interval_boundary_samples_excluded = 0
         fps_points: tuple[tuple[float, float], ...] = ()
         fps_x_label = interval_x_label
         fps_method = "No raw frame intervals were stored."
@@ -289,6 +372,10 @@ def _load_analysis(
             connection, benchmark_id, row, max_plot_points
         )
     else:
+        boundary_record_id = _legacy_first_interval_boundary_id(
+            connection, benchmark_id, interval_source
+        )
+        interval_boundary_samples_excluded = int(boundary_record_id is not None)
         (
             interval_stats,
             interval_points,
@@ -298,11 +385,17 @@ def _load_analysis(
             fps_x_label,
             fps_method,
             interval_method,
-        ) = _read_interval_series(connection, benchmark_id, interval_source, max_plot_points)
+        ) = _read_interval_series(
+            connection, benchmark_id, interval_source, max_plot_points,
+            excluded_raw_record_id=boundary_record_id,
+        )
         interval_metric, interval_scope = interval_source.metric, interval_source.scope
         interval_data_available = interval_stats.count > 0
         if interval_data_available and interval_scope == "capture":
-            capture_fps_stats = _capture_fps_from_intervals(connection, benchmark_id, interval_source, interval_stats)
+            capture_fps_stats = _capture_fps_from_intervals(
+                connection, benchmark_id, interval_source, interval_stats,
+                excluded_raw_record_id=boundary_record_id,
+            )
         elif interval_data_available:
             capture_fps_stats, fps_points, fps_x_label, fps_method = _stored_capture_fps(
                 connection, benchmark_id, row, max_plot_points
@@ -355,6 +448,7 @@ def _load_analysis(
         saved_status=option.status,
         termination_reason=str(termination_reason) if termination_reason else None,
         interval_data_available=interval_data_available,
+        interval_boundary_samples_excluded=interval_boundary_samples_excluded,
     )
 
 
@@ -391,11 +485,36 @@ def _select_interval_source(connection: Any, benchmark_id: str) -> _IntervalSour
     return None
 
 
+def _legacy_first_interval_boundary_id(
+    connection: Any, benchmark_id: str, source: _IntervalSource
+) -> int | None:
+    """Identify a legacy CSV first-row zero marker without deleting its raw record."""
+    if source.metric != "capture_frame_interval_ms" or source.scope != "capture":
+        return None
+    row = connection.execute(
+        """SELECT m.raw_record_id, m.value, m.method
+           FROM measurements m LEFT JOIN raw_records rr ON rr.id=m.raw_record_id
+           WHERE m.benchmark_id=? AND m.metric=? AND m.stream_scope=? AND m.value>=0
+           ORDER BY rr.row_number IS NULL, rr.row_number, m.id LIMIT 1""",
+        (benchmark_id, source.metric, source.scope),
+    ).fetchone()
+    if (
+        row is not None
+        and row["raw_record_id"] is not None
+        and float(row["value"]) == 0.0
+        and row["method"] == "legacy_csv:interval_ms"
+    ):
+        return int(row["raw_record_id"])
+    return None
+
+
 def _read_interval_series(
     connection: Any,
     benchmark_id: str,
     source: _IntervalSource,
     max_plot_points: int,
+    *,
+    excluded_raw_record_id: int | None = None,
 ) -> tuple[MetricStats, tuple[tuple[float, float], ...], str, Histogram,
            tuple[tuple[float, float], ...], str, str, str | None]:
     where = "benchmark_id=? AND metric=? AND stream_scope=? AND value >= 0"
@@ -403,6 +522,9 @@ def _read_interval_series(
     if source.requires_interval_ns:
         where = "benchmark_id=? AND metric=? AND stream_scope=? AND interval_ns IS NOT NULL AND interval_ns >= 0"
         params = (benchmark_id, source.metric, source.scope)
+    if excluded_raw_record_id is not None:
+        where += " AND (raw_record_id IS NULL OR raw_record_id != ?)"
+        params += (excluded_raw_record_id,)
     aggregate = connection.execute(
         f"""SELECT COUNT(*) AS n, MIN({source.value_expression}) AS minimum,
                    MAX({source.value_expression}) AS maximum, AVG({source.value_expression}) AS mean,
@@ -420,9 +542,18 @@ def _read_interval_series(
     minimum = float(aggregate["minimum"])
     maximum = float(aggregate["maximum"])
     mean = float(aggregate["mean"])
-    median = _ordered_percentile(connection, source, benchmark_id, count, 0.50, median=True)
-    p95 = _ordered_percentile(connection, source, benchmark_id, count, 0.95)
-    p99 = _ordered_percentile(connection, source, benchmark_id, count, 0.99)
+    median = _ordered_percentile(
+        connection, source, benchmark_id, count, 0.50, median=True,
+        excluded_raw_record_id=excluded_raw_record_id,
+    )
+    p95 = _ordered_percentile(
+        connection, source, benchmark_id, count, 0.95,
+        excluded_raw_record_id=excluded_raw_record_id,
+    )
+    p99 = _ordered_percentile(
+        connection, source, benchmark_id, count, 0.99,
+        excluded_raw_record_id=excluded_raw_record_id,
+    )
     stats = MetricStats(count, minimum, maximum, mean, median, p95, p99)
     all_have_elapsed = int(aggregate["elapsed_count"]) == count
     x_label = (
@@ -436,7 +567,7 @@ def _read_interval_series(
     extrema: dict[int, list[tuple[int, float, float]]] = {}
     rates: dict[int, list[float]] = {}
     histogram_counts = [0] * HISTOGRAM_BINS
-    positive_count = underflow_count = overflow_count = 0
+    positive_count = zero_count = underflow_count = overflow_count = 0
     cumulative_seconds = 0.0
     if all_have_elapsed:
         time_origin = float(aggregate["first_elapsed"] or 0.0)
@@ -482,7 +613,9 @@ def _read_interval_series(
         rate[1] += interval_ms / 1000.0
         rate[2] += x
 
-        if interval_ms > 0:
+        if interval_ms == 0:
+            zero_count += 1
+        else:
             positive_count += 1
             if interval_ms < HISTOGRAM_MIN_MS:
                 index = 0
@@ -502,7 +635,9 @@ def _read_interval_series(
         for ordinal, x, value in pair:
             points_by_index[ordinal] = (x, value)
     points = tuple(points_by_index[index] for index in sorted(points_by_index))
-    histogram = _make_histogram(histogram_counts, positive_count, underflow_count, overflow_count)
+    histogram = _make_histogram(
+        histogram_counts, positive_count, zero_count, underflow_count, overflow_count
+    )
 
     fps_points = tuple(
         (values[2] / values[0], values[0] / values[1])
@@ -524,6 +659,7 @@ def _ordered_percentile(
     *,
     median: bool = False,
     descending: bool = False,
+    excluded_raw_record_id: int | None = None,
 ) -> float | None:
     if count < 1:
         return None
@@ -531,13 +667,15 @@ def _ordered_percentile(
         low = (count - 1) // 2
         high = count // 2
         values = [
-            _value_at_offset(connection, source, benchmark_id, low, descending),
-            _value_at_offset(connection, source, benchmark_id, high, descending),
+            _value_at_offset(connection, source, benchmark_id, low, descending, excluded_raw_record_id),
+            _value_at_offset(connection, source, benchmark_id, high, descending, excluded_raw_record_id),
         ]
         valid = [value for value in values if value is not None]
         return sum(valid) / len(valid) if valid else None
     offset = max(0, math.ceil(count * fraction) - 1)
-    return _value_at_offset(connection, source, benchmark_id, offset, descending)
+    return _value_at_offset(
+        connection, source, benchmark_id, offset, descending, excluded_raw_record_id
+    )
 
 
 def _value_at_offset(
@@ -546,15 +684,20 @@ def _value_at_offset(
     benchmark_id: str,
     offset: int,
     descending: bool,
+    excluded_raw_record_id: int | None = None,
 ) -> float | None:
     where = "benchmark_id=? AND metric=? AND stream_scope=? AND value >= 0"
     if source.requires_interval_ns:
         where = "benchmark_id=? AND metric=? AND stream_scope=? AND interval_ns IS NOT NULL AND interval_ns >= 0"
     direction = "DESC" if descending else "ASC"
+    params: tuple[object, ...] = (benchmark_id, source.metric, source.scope)
+    if excluded_raw_record_id is not None:
+        where += " AND (raw_record_id IS NULL OR raw_record_id != ?)"
+        params += (excluded_raw_record_id,)
     row = connection.execute(
         f"""SELECT {source.value_expression} AS value FROM measurements WHERE {where}
             ORDER BY {source.value_expression} {direction} LIMIT 1 OFFSET ?""",
-        (benchmark_id, source.metric, source.scope, offset),
+        (*params, offset),
     ).fetchone()
     return float(row["value"]) if row else None
 
@@ -564,12 +707,15 @@ def _capture_fps_from_intervals(
     benchmark_id: str,
     source: _IntervalSource,
     interval_stats: MetricStats,
+    *,
+    excluded_raw_record_id: int | None = None,
 ) -> MetricStats:
     if interval_stats.mean is None or interval_stats.mean <= 0:
         return MetricStats(0)
     count = interval_stats.count
     median_interval_in_fps_order = _ordered_percentile(
-        connection, source, benchmark_id, count, 0.5, median=True, descending=True
+        connection, source, benchmark_id, count, 0.5, median=True, descending=True,
+        excluded_raw_record_id=excluded_raw_record_id,
     )
     fps_median = 1000.0 / median_interval_in_fps_order if median_interval_in_fps_order and median_interval_in_fps_order > 0 else None
     fps_mean = 1000.0 / interval_stats.mean
@@ -816,10 +962,10 @@ def _first_method(connection: Any, benchmark_id: str, source: _IntervalSource) -
 
 
 def _make_histogram(
-    counts: list[int], total: int, underflow: int, overflow: int
+    counts: list[int], total: int, zero_count: int, underflow: int, overflow: int
 ) -> Histogram:
     if total <= 0:
-        return Histogram()
+        return Histogram(zero_sample_count=zero_count)
     log_span = math.log(HISTOGRAM_MAX_MS / HISTOGRAM_MIN_MS)
     centers = tuple(
         HISTOGRAM_MIN_MS * math.exp(log_span * (index + 0.5) / HISTOGRAM_BINS)
@@ -830,6 +976,7 @@ def _make_histogram(
         centers_ms=tuple(point[0] for point in nonzero),
         fractions=tuple(point[1] for point in nonzero),
         positive_sample_count=total,
+        zero_sample_count=zero_count,
         underflow_count=underflow,
         overflow_count=overflow,
     )
@@ -872,6 +1019,44 @@ def _capture_configuration(configuration: dict[str, Any]) -> tuple[dict[str, Any
     if not requested and not reported and configuration.get("legacy_mode"):
         return {}, {}, f"Imported mode: {configuration['legacy_mode']}"
     return requested, reported, None
+
+
+def _requested_fps(settings: dict[str, Any]) -> float | None:
+    for key in ("requested_fps", "fps", "frame_rate"):
+        value = settings.get(key)
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(result) and result > 0:
+            return result
+    return None
+
+
+def _mode_filter_label(
+    requested: dict[str, Any], reported: dict[str, Any], configuration_note: str | None
+) -> str:
+    settings = requested or reported
+    dimensions = []
+    width, height = settings.get("width"), settings.get("height")
+    if width is not None and height is not None:
+        dimensions.append(f"{width}×{height}")
+    pixel_format = settings.get("pixel_format") or settings.get("format") or settings.get("fourcc")
+    if pixel_format:
+        dimensions.append(str(pixel_format))
+    fps = _requested_fps(requested)
+    if fps is not None:
+        dimensions.append(f"{fps:g} FPS requested")
+    if dimensions:
+        source = "requested" if requested else "driver-reported"
+        return f"{source} · " + " · ".join(dimensions)
+    if configuration_note:
+        return "legacy · " + configuration_note.removeprefix("Imported mode: ")
+    return "Mode unavailable"
+
+
+def _camera_key_fallback(camera: str) -> str:
+    return "camera-name:" + " ".join(camera.casefold().split())
 
 
 def _empty_analysis(

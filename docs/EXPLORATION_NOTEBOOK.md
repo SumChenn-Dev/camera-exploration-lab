@@ -20,7 +20,7 @@ The original private development history contains three completed milestones. Th
 | Phase 0 — Foundation | SQLite schema, camera discovery model, historical CSV importer, session data model, logging, and camera-independent tests. | Automated tests use synthetic records and temporary databases. |
 | Phase 1 — Live Workbench | Preview-first PySide6 workbench, independent capture and preview loops, persistent metric labels, and V4L2 mode/readback display. | Mocked tests and host capture checks with two native USB cameras. |
 | Phase 2A — Experiment recording | Timed and manual sessions, notes, bounded streaming timing storage, SQLite summaries, and a basic History view. | Automated tests passed; a completed physical recording was inspected in History. Detailed run values remain in the local database. |
-| Phase 2B — Experiment analysis | Read-only Analysis workspace with a frame-interval timeline, windowed capture-FPS curve, summaries, and two-run comparison. | Synthetic tests cover timing math, imported/interrupted records, bounded plots, query-only reads, and History navigation; host visual review remains pending. |
+| Phase 2B — Experiment analysis | Read-only Analysis dashboard with camera/mode/rate filters, Session A/B comparison, timing curves, interval distributions, and summary cards. | Synthetic tests cover timing math, filters, imported/interrupted records, bounded plots, query-only reads, and History navigation; follow-up visual review is requested for the dashboard refinements. |
 
 ## Confirmed discoveries and design decisions
 
@@ -31,8 +31,10 @@ The original private development history contains three completed milestones. Th
 | Use a single latest-frame preview slot and a bounded timing queue with a database writer. | Slow rendering or storage must not create unbounded frame or sample queues or block capture. |
 | Preserve requested settings separately from driver-reported and verified settings. | A request is not evidence that the driver accepted the value. |
 | Preserve raw source rows alongside normalized historical measurements. | Later analysis needs both the original input and normalized fields. |
-| Exclude a recording's first interval when it began before the recording boundary. | That interval does not describe two arrivals within the experiment. |
+| Exclude only an importer-marked first CSV interval of `0.000 ms` from derived statistics when it has no preceding frame; preserve its raw source row. | The source value is a recording-boundary marker, not an elapsed frame interval. Other zero values remain in calculations and are reported separately from positive log-histogram bins. |
 | Analyze history through a query-only connection and stream plot samples into min/max buckets. | Analysis must not alter research data, freeze the UI, or erase timing spikes during visual downsampling. |
+| Use V4L2 `Device Caps` when the driver advertises per-node capabilities. | A single physical UVC camera can expose both image capture and metadata-only nodes; the broader capability mask is not specific to each node. |
+| Overlay capture-rate curves only when both recordings have recorder elapsed timestamps; never interpolate missing samples. | Curves retain each separate session's timing basis, duration, and sampling density. Separate runs are not simultaneous measurements. |
 | Show imported summary fields as stored values when raw intervals are absent. | Legacy history does not always support recalculating a complete distribution. |
 | Treat local databases and logs as user data. | They can contain camera identity, paths, experiment names, notes, and imported records. |
 | Keep computer-vision prototypes optional and wardrobe inventory separate. | These workflows need different dependencies, interfaces, and privacy boundaries. |
@@ -56,6 +58,15 @@ The original private development history contains three completed milestones. Th
 | CEL-012 | Derive controlled experiment conclusions from repeatable evidence. | Research practice | Proposed | Define what result, uncertainty, and conditions support each conclusion. |
 
 ## Simultaneous V4L2 capture observations
+
+### 2026-10-14 — Analysis and imported-interval review
+
+- Kind: decision and observation
+- Context: host visual review found dense Analysis metadata, clipped comparison labels, missing-looking imported distribution curves, and a duplicate UVC endpoint in discovery.
+- Finding or choice: the Analysis view now uses a compact camera/mode/date/duration/status header, labeled metrics, expandable technical details, searchable camera/mode/requested-FPS filters, Session A/B selectors, and elapsed-time comparison curves that keep their own samples. V4L2 discovery uses per-node `Device Caps` and excludes metadata-only endpoints while retaining valid virtual capture nodes.
+- Evidence: source review and read-only inspection of local imported history found `0.000 ms` values at the first interval row of imported runs. Those source rows remain intact; only that importer-marked first-row boundary value is excluded from derived interval statistics because it has no preceding frame. Synthetic tests cover preservation and the exclusion rule.
+- Limitations: these changes do not measure sensor latency, synchronize separate recordings, or infer absent timing samples. Visual review of the revised dashboard remains pending.
+- Follow-up: complete owner review, then keep CEL-013 Multi-Camera Experiment Recording as the next functional milestone.
 
 ### 2026-10-13 — PS3 Eye and AVerMedia concurrent delivery
 

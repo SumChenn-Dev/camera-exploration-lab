@@ -15,6 +15,7 @@ try:
     from camera_exploration_lab.db import Database
     from camera_exploration_lab.models import BackendKind, BenchmarkRecord, CameraCandidate, CameraIdentity, MeasurementSample, SessionRecord, StreamScope
     from camera_exploration_lab.ui.live_workbench import LiveWorkbenchWindow
+    from camera_exploration_lab.ui.live_workbench import recording_readiness_message
 
     QT_AVAILABLE = True
 except ImportError:
@@ -103,6 +104,48 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             time.sleep(0.005)
         self.application.processEvents()
         return predicate()
+
+    def test_recording_status_reports_missing_name_when_preview_is_ready(self) -> None:
+        window = LiveWorkbenchWindow(
+            SyntheticDiscovery(), self.database,
+            capture_factory=lambda _device: FakeCapture(),
+        )
+        window.camera_combo.setCurrentIndex(0)
+        window.start_capture()
+        self.assertTrue(self._process_until(
+            lambda: window._worker is not None
+            and window._worker.snapshot().state == CaptureState.RUNNING
+        ))
+        self.assertEqual(window.recording_status.text(), "Enter a short experiment name first.")
+        self.assertFalse(window.record_start_button.isEnabled())
+        window.experiment_name.setText("Synthetic status check")
+        self.assertEqual(
+            window.recording_status.text(),
+            "Ready to record; live preview will continue independently.",
+        )
+        self.assertTrue(window.record_start_button.isEnabled())
+        window.close()
+
+    def test_recording_status_helper_prioritizes_live_blocker(self) -> None:
+        self.assertEqual(
+            recording_readiness_message(
+                has_camera=True, has_mode=True, capture_ready=True, has_name=False,
+            ),
+            "Enter a short experiment name first.",
+        )
+        self.assertEqual(
+            recording_readiness_message(
+                has_camera=True, has_mode=True, capture_ready=False, has_name=True,
+            ),
+            "Start preview and wait for negotiated camera settings before recording.",
+        )
+        self.assertIn(
+            "initialization failed",
+            recording_readiness_message(
+                has_camera=True, has_mode=True, capture_ready=False, has_name=True,
+                capture_state=CaptureState.FAILED,
+            ).lower(),
+        )
 
     def test_preview_continues_during_recording_and_history_includes_imported_data(self) -> None:
         imported = SessionRecord(camera_id=None, label="Imported: ps-eye.csv", source="imported")
@@ -230,7 +273,7 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
         window.start_recording()
         self.assertEqual(self.database.count("sessions"), 0)
         self.assertEqual(self.database.count("benchmark_runs"), 0)
-        self.assertIn("Wait for camera", window.recording_status.text())
+        self.assertIn("initialization failed", window.recording_status.text().lower())
         window.close()
 
     def test_history_row_opens_the_same_run_in_analysis(self) -> None:

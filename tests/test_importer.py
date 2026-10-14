@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from camera_exploration_lab.analysis import load_analysis
 from camera_exploration_lab.db import Database
 from camera_exploration_lab.importer import CSVHistoryImporter
 
@@ -84,6 +85,43 @@ class CSVHistoryImporterTests(unittest.TestCase):
         self.assertEqual(setting["reported_value_json"], "125")
         self.assertIsNone(setting["verified_value_json"])
         self.assertEqual(setting["verification_status"], "reported")
+
+    def test_first_legacy_zero_interval_is_preserved_and_excluded_as_boundary(self) -> None:
+        source = self.root / "synthetic-avermedia.csv"
+        fields = ["mode", "timestamp", "frame_number", "elapsed_s", "interval_ms"]
+        original = self.write_csv(source, fields, [
+            {"mode": "720p_mjpeg", "timestamp": "2026-10-14T10:00:00", "frame_number": "1",
+             "elapsed_s": "0.025", "interval_ms": "0.000"},
+            {"mode": "720p_mjpeg", "timestamp": "2026-10-14T10:00:00.016", "frame_number": "2",
+             "elapsed_s": "0.041", "interval_ms": "16.000"},
+            {"mode": "720p_mjpeg", "timestamp": "2026-10-14T10:00:00.033", "frame_number": "3",
+             "elapsed_s": "0.058", "interval_ms": "17.000"},
+        ])
+        imported = CSVHistoryImporter(self.database).import_file(source)
+        with self.database.connect_readonly() as connection:
+            benchmark_id = connection.execute(
+                "SELECT id FROM benchmark_runs WHERE session_id=?", (imported.session_id,)
+            ).fetchone()[0]
+            first = connection.execute(
+                """SELECT m.value, m.interval_ns, m.method, rr.raw_json
+                   FROM measurements m JOIN raw_records rr ON rr.id=m.raw_record_id
+                   WHERE m.benchmark_id=? AND m.metric='capture_frame_interval_ms'
+                   ORDER BY rr.row_number LIMIT 1""",
+                (benchmark_id,),
+            ).fetchone()
+
+        analysis = load_analysis(self.database, benchmark_id, imported.session_id)
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(first["value"], 0.0)
+        self.assertEqual(first["interval_ns"], 0)
+        self.assertEqual(json.loads(first["raw_json"])["interval_ms"], "0.000")
+        self.assertEqual(first["method"], "legacy_csv:interval_ms")
+        self.assertEqual(analysis.interval_boundary_samples_excluded, 1)
+        self.assertEqual(analysis.interval_stats.count, 2)
+        self.assertEqual(analysis.interval_stats.minimum, 16.0)
+        self.assertEqual(analysis.interval_stats.maximum, 17.0)
+        self.assertEqual(analysis.interval_histogram.zero_sample_count, 0)
+        self.assertAlmostEqual(analysis.capture_fps_stats.mean or 0.0, 1000 / 16.5)
 
     def test_canon_live_view_fps_is_separate_from_capture_fps(self) -> None:
         source = self.root / "camera-recordings/performance/canon/live.csv"

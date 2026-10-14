@@ -45,6 +45,26 @@ from .analysis_workspace import AnalysisWorkspace
 logger = logging.getLogger(__name__)
 
 
+def recording_readiness_message(
+    *, has_camera: bool, has_mode: bool, capture_ready: bool, has_name: bool,
+    capture_state: CaptureState | None = None,
+) -> str:
+    """Return the current concrete blocker for starting a recording."""
+    if not has_camera or not has_mode:
+        return "Select a camera and capture mode before recording."
+    if not capture_ready:
+        if capture_state == CaptureState.FAILED:
+            return "Camera capture initialization failed; review the Live Workbench error before retrying."
+        if capture_state == CaptureState.UNAVAILABLE:
+            return "Camera is unavailable. Reconnect it or select another camera."
+        if capture_state == CaptureState.STARTING:
+            return "Wait for camera initialization and negotiated settings before recording."
+        return "Start preview and wait for negotiated camera settings before recording."
+    if not has_name:
+        return "Enter a short experiment name first."
+    return "Ready to record; live preview will continue independently."
+
+
 def _mode_for_combo(combo: QComboBox) -> CaptureMode | None:
     mode = combo.currentData(Qt.ItemDataRole.UserRole)
     return mode if isinstance(mode, CaptureMode) else None
@@ -304,7 +324,7 @@ class LiveWorkbenchWindow(QMainWindow):
         self.record_stop_button.clicked.connect(self.stop_recording)
         record_controls.addWidget(self.record_start_button)
         record_controls.addWidget(self.record_stop_button)
-        self.recording_status = QLabel("Preview must be running before recording can start.")
+        self.recording_status = QLabel("Select a camera and capture mode before recording.")
         self.recording_status.setWordWrap(True)
         self.recording_progress = QProgressBar()
         self.recording_progress.setRange(0, 1000)
@@ -317,7 +337,7 @@ class LiveWorkbenchWindow(QMainWindow):
         recording_layout.addWidget(self.recording_status)
         recording_layout.addWidget(self.recording_progress)
         diagnostics_layout.addWidget(recording_box)
-        self.experiment_name.textChanged.connect(self._update_buttons)
+        self.experiment_name.textChanged.connect(self._experiment_name_changed)
 
         self.capture_message = QLabel("Capture FPS counts frames returned by OpenCV. Frame interval is host observed; neither is sensor latency.")
         self.capture_message.setWordWrap(True)
@@ -692,16 +712,22 @@ class LiveWorkbenchWindow(QMainWindow):
         candidate = _candidate_for_combo(self.camera_combo)
         worker = self._worker
         mode = _mode_for_combo(self.mode_combo)
-        if candidate is None or mode is None or worker is None:
-            self.recording_status.setText("Select a camera and start its preview before recording.")
+        snapshot = worker.snapshot() if worker is not None else None
+        message = recording_readiness_message(
+            has_camera=candidate is not None,
+            has_mode=mode is not None,
+            capture_ready=bool(
+                worker and worker.is_alive() and snapshot is not None
+                and snapshot.state == CaptureState.RUNNING
+                and snapshot.negotiated is not None
+            ),
+            has_name=bool(self.experiment_name.text().strip()),
+            capture_state=snapshot.state if snapshot is not None else None,
+        )
+        if message != "Ready to record; live preview will continue independently.":
+            self.recording_status.setText(message)
             return
-        snapshot = worker.snapshot()
-        if snapshot.state != CaptureState.RUNNING or snapshot.negotiated is None:
-            self.recording_status.setText("Wait for camera readback and a running preview before recording.")
-            return
-        if not self.experiment_name.text().strip():
-            self.recording_status.setText("Enter a short experiment name first.")
-            return
+        assert snapshot is not None
         try:
             duration = self.duration_combo.currentData(Qt.ItemDataRole.UserRole)
             self._recorder = ExperimentRecorder(
@@ -926,6 +952,23 @@ class LiveWorkbenchWindow(QMainWindow):
         self.experiment_name.setEnabled(not recording_active)
         self.experiment_notes.setEnabled(not recording_active)
         self.duration_combo.setEnabled(not recording_active)
+        if not recording_active and self._last_recording_snapshot is None:
+            message = recording_readiness_message(
+                has_camera=candidate is not None,
+                has_mode=_mode_for_combo(self.mode_combo) is not None,
+                capture_ready=bool(
+                    capture_ready and self._worker
+                    and self._worker.snapshot().negotiated is not None
+                ),
+                has_name=bool(self.experiment_name.text().strip()),
+                capture_state=self._worker.snapshot().state if self._worker else None,
+            )
+            self.recording_status.setText(message)
+
+    def _experiment_name_changed(self, _text: str = "") -> None:
+        if self._recorder is None:
+            self._last_recording_snapshot = None
+        self._update_buttons()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override name
         self._poll_timer.stop()

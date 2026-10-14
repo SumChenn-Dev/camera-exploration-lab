@@ -29,7 +29,7 @@ Specialized computer-vision experiments should be optional extensions. An extens
 | --- | --- | --- |
 | Data models, CSV, logs, CLI | Python standard library | Implemented |
 | Storage | Python `sqlite3` | Implemented; schema version 2 adds summaries and indexes |
-| V4L2 discovery | `/sys/class/video4linux`, `/dev/v4l/by-id` | Implemented read-only |
+| V4L2 discovery | sysfs identity plus read-only `VIDIOC_QUERYCAP` | Implemented; image-capture nodes only |
 | Desktop | PySide6 | Optional `desktop` extra; Live Workbench, History, and Analysis implemented |
 | Graphs | PyQtGraph | Optional `desktop` extra; interval/FPS plots and interval-distribution comparison implemented |
 | Frame capture and processing | NumPy + `opencv-python-headless` | Optional `desktop` extra; V4L2 capture worker implemented |
@@ -39,7 +39,7 @@ The headless OpenCV wheel avoids bundling a second Qt runtime alongside PySide6.
 
 ## Identity and discovery
 
-`V4L2Discovery` enumerates sysfs video nodes without opening devices or setting controls. If a `/dev/v4l/by-id` alias points to a node, that alias becomes the stable identifier. The current `/dev/videoN` node is saved separately as the open path because its number can change. Without a by-id alias, discovery derives an endpoint identity from USB IDs plus serial or port topology and the V4L2 interface index, then falls back to the sysfs device path.
+`V4L2Discovery` uses sysfs for identity and briefly opens each present node read-only to issue `VIDIOC_QUERYCAP`; it does not set camera controls. When the driver advertises `V4L2_CAP_DEVICE_CAPS`, discovery uses that effective per-node mask instead of the broader `capabilities` mask. Only `VIDEO_CAPTURE` and `VIDEO_CAPTURE_MPLANE` nodes appear in the camera selector. Metadata-only nodes are filtered out, while valid virtual capture devices such as OBS Virtual Camera remain eligible. If a `/dev/v4l/by-id` alias points to a node, that alias becomes the stable identifier. The current `/dev/videoN` node is saved separately as the open path because its number can change. Without a by-id alias, discovery derives an endpoint identity from USB IDs plus serial or port topology and the V4L2 interface index, then falls back to the sysfs device path.
 
 The camera model supports `v4l2`, `chdkptp`, and `unknown` backends. A future CHDKPTP adapter will expose cameras through the same selection and session APIs; the installed presence of a CHDKPTP executable is not treated as proof that a camera is connected.
 
@@ -70,7 +70,7 @@ The local database can contain camera serial numbers, machine-specific source pa
 
 ## Historical analysis
 
-The Analysis workspace reads the existing schema version 2 through a SQLite URI opened in read-only mode with query-only enabled. It does not initialize or migrate the database, and Phase 2B adds no schema changes. A dedicated Qt worker performs the queries so larger histories do not block the event loop.
+The Analysis workspace reads the existing schema version 2 through a SQLite URI opened in read-only mode with query-only enabled. It does not initialize or migrate the database, and Phase 2B adds no schema changes. A dedicated Qt worker performs the queries so larger histories do not block the event loop. The experiment index includes camera identity, requested capture mode, and requested FPS for filters. Search narrows readable experiment labels. Session A and Session B default to different runs from the same camera when available; filters can be cleared for cross-camera comparisons. History opens the exact selected run as Session A.
 
 The interval timeline uses persisted capture-scoped frame_interval_ms values, falling back to interval nanoseconds on frame_arrival rows when needed. When recorder elapsed values are present they supply the horizontal coordinate; otherwise the chart uses cumulative persisted intervals and says so on the axis. The first interval can be absent when recording began during preview because its earlier endpoint may be outside the experiment boundary.
 
@@ -78,7 +78,11 @@ Frame-interval min, max, mean, median, p95, and p99 are calculated from stored s
 
 Requested driver frame rate, driver-reported rate, observed capture rate, GUI preview rate, and processing rate remain separate. The curve estimates host frame-arrival throughput. Recorded UTC timestamps are taken after OpenCV read returns, and intervals use host monotonic time; neither reveals sensor exposure timing, cross-camera synchronization, or sensor-to-display latency.
 
-Chart data is streamed from SQLite and reduced to per-bucket minima and maxima, retaining visible spikes and global extrema with a fixed point budget. Percentiles are queried exactly from SQLite. Imported or incomplete histories may have only per-row legacy fields or saved summaries; the UI identifies stored summary fields and does not draw a raw timeline where raw intervals are absent.
+Chart data is streamed from SQLite and reduced to per-bucket minima and maxima, retaining visible spikes and global extrema with a fixed point budget. Percentiles are queried exactly from SQLite. Session FPS curves are overlaid only when both runs have recorder elapsed timestamps. Each curve keeps its own sample times and duration; no interpolation or simultaneous-capture claim is made. An optional percentage view normalizes each window against that session's observed mean. Interval timelines overlay only when elapsed-time basis, stream scope, and timing method match. Shared log histogram bins show normalized positive intervals with visible point markers; zero samples remain in summaries and are called out because zero cannot be placed on a log axis.
+
+For imported legacy CSV data, a zero interval in the first interval row with method `legacy_csv:interval_ms` is treated as a boundary marker: no earlier frame exists for that row. The normalized measurement and original raw CSV row remain in SQLite, while that one marker is excluded from derived interval statistics and FPS calculations. Other zero values, including live-recorded zeros, remain part of calculations and are reported separately from positive histogram bins. No database schema change is required.
+
+The Analysis page uses a vertical scroll area and adjustable plot splitters. Metric cards stay compact; driver details, timing methods, timestamp scope, interval exclusions, and notes are expanded on demand. Short plot titles and abbreviated comparison headers avoid clipping, with tooltips and horizontal table scrolling for full labels.
 
 ## Bazzite packaging and launch
 

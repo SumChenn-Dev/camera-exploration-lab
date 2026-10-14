@@ -12,9 +12,11 @@ The current application includes:
 - Independent camera capture and GUI preview loops. Capture can run faster than the screen refresh without building a frame queue.
 - Fixed duration and manual experiment recording, with requested settings, driver readback, notes, timestamps, summary statistics, and raw timing samples stored in SQLite.
 - A History tab for local experiment sessions and imported CSV measurements.
-- An Analysis tab with a frame-interval timeline, a windowed capture-FPS curve, summary statistics, and a two-experiment comparison.
+- An Analysis tab with camera/mode/requested-FPS filters, searchable Session A/B selection, summary cards, timing curves, interval distributions, and same-camera comparisons by default.
 
-The Analysis tab can be opened from History with the Analyze selected button. It shows camera identity, capture settings, start time, duration, notes, capture and preview rates, frame intervals, failures, and the source of stored measurements. Compare mode overlays normalized interval distributions and shows delivered-rate, percentile, failure, and duration differences.
+The Analysis tab can be opened from History with the Analyze selected button. It shows a compact experiment header and labeled cards for observed capture FPS, GUI preview FPS, processing FPS when recorded, frame count, interval percentiles, and read failures. Expand Technical details for requested and driver-reported settings, timing methods, timestamp scope, duration source, and notes. Filters and search narrow Session A and B; a different recording from the same camera is selected by default when available. Use Swap A / B or Clear B to change the comparison.
+
+With two sessions selected, the Analysis tab overlays capture-FPS curves only when both have recorder elapsed timestamps. Different durations and sampling densities retain their own sample points; no interpolation or simultaneous-capture claim is made. The optional deviation view expresses each window relative to that session's observed mean. Interval timelines overlay only when timing scope and method match. Interval distributions use shared logarithmic bins for positive values; zero samples are reported separately because a log axis cannot display zero.
 
 Analysis distinguishes requested settings, driver readback, observed capture throughput, GUI preview cadence, and future processing throughput. Its FPS curve uses non-overlapping windows of recorded frame intervals (one second by default; longer windows for very long recordings). Imported or incomplete records may have summary-only values and are labeled accordingly. Frame-arrival timestamps are host observations after OpenCV returns; neither they nor frame intervals measure sensor exposure or sensor-to-display latency. Analysis opens SQLite read-only and does not change the local database. Raw video is not retained by the recorder.
 
@@ -137,7 +139,7 @@ test -n "$DATABASE"
 "$VENV/bin/celab" --database "$DATABASE" gui
 ```
 
-In the Live Workbench, select a camera and mode, start preview, and check the driver-reported settings. Start a 10, 30, 60, or 120 second experiment and confirm that the preview continues while recording. Then inspect the result and any imported sessions in History. Do not treat read duration or frame interval as sensor latency.
+In the Live Workbench, select a camera and mode, start preview, and check the driver-reported settings. Camera discovery checks each node's effective V4L2 device capabilities, so metadata-only endpoints are omitted while genuine virtual capture devices remain eligible. Start a 10, 30, 60, or 120 second experiment and confirm that the preview continues while recording. Then inspect the result and any imported sessions in History. Do not treat read duration or frame interval as sensor latency.
 
 ## Contributing and license
 

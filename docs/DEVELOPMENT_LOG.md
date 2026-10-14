@@ -31,6 +31,17 @@ This log records completed engineering milestones and the public repository setu
 - Sanitized host throughput observations, including the 720-second concurrent V4L2 run, are recorded in the [Exploration Notebook](EXPLORATION_NOTEBOOK.md). Raw logs and experiment records remain local.
 - Automated verification is camera-free. Visual review against the existing Bazzite history database remains a manual check.
 
+## Phase 2B — UI refinement and V4L2 discovery follow-up
+
+- Replaced the dense Analysis metadata block with a compact experiment header, eight persistent metric cards, expandable technical details, searchable camera/mode/requested-FPS filters, and explicit Session A/B controls.
+- Added elapsed-time capture-FPS overlays and optional deviation-from-session-mean curves. Curves keep each recording's recorded sample times; interval overlays require matching elapsed-time basis, scope, and method. Separate sessions are labeled as non-simultaneous.
+- Made positive interval distribution curves visible with distinct markers and explicit normalization. Zero values are retained in interval summaries and called out separately from log-axis data.
+- Read-only review of imported CAM 313 history confirmed that its `0.000 ms` first interval row is present in the source CSV and raw-record table. Analysis preserves that row and excludes only the first importer-marked zero boundary from derived statistics and FPS calculations; later zero values remain included.
+- Changed V4L2 discovery to use the effective per-node `Device Caps` from `VIDIOC_QUERYCAP`, filtering metadata-only endpoints while retaining valid virtual capture devices. The query uses a brief read-only device open and does not alter controls.
+- Corrected recording readiness text so a running preview with a blank experiment name names the missing name, while failed capture initialization reports that failure.
+- Verification: all 71 camera-free tests passed with verbose output; 26 Python source/test files compiled in memory; `pip check` found no broken requirements; `git diff --check` passed. The read-only release audit found no blockers or local-identity matches; synthetic device identifiers were informational only. No schema migration or local research-data changes were made.
+- Manual Bazzite visual review of the updated layout remains requested. CEL-013 Multi-Camera Experiment Recording remains the next functional milestone after Phase 2B review.
+
 ## First public repository
 
 - Published an independent, privacy-reviewed initial snapshot on GitHub. The public checkout starts from its own root commit and does not contain the original private development history.

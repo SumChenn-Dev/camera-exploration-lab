@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from camera_exploration_lab.analysis import load_analysis as real_load_analysis
 from camera_exploration_lab.db import Database
@@ -91,6 +91,8 @@ class AnalysisWorkspaceResponsivenessTests(unittest.TestCase):
         self.assertNotEqual(worker_threads[0], threading.get_ident())
         self.assertLessEqual(len(workspace._primary.interval_points), 2400)
         self.assertLessEqual(len(workspace._primary.fps_points), 2400)
+        plotted_intervals = workspace.interval_plot.plotItem.listDataItems()[0].getData()[1]
+        self.assertIn(55.0, plotted_intervals)
         workspace.close()
 
     def test_two_experiments_populate_comparison_metrics_and_distributions(self) -> None:
@@ -117,6 +119,7 @@ class AnalysisWorkspaceResponsivenessTests(unittest.TestCase):
                 value=40.0 + index,
                 unit="ms",
                 stream_scope=StreamScope.CAPTURE,
+                elapsed_seconds=(index + 1) * 0.04,
                 sample_index=index + 1,
                 interval_ns=(40 + index) * 1_000_000,
                 method="synthetic MJPEG intervals",
@@ -138,12 +141,93 @@ class AnalysisWorkspaceResponsivenessTests(unittest.TestCase):
 
         self.assertGreater(workspace.comparison_table.rowCount(), 10)
         self.assertEqual(len(workspace.distribution_plot.plotItem.listDataItems()), 2)
+        self.assertEqual(len(workspace.fps_plot.plotItem.listDataItems()), 2)
+        self.assertTrue(workspace.fps_deviation_checkbox.isEnabled())
+        self.assertIn("Separate recordings", workspace.comparison_notice.text())
+        self.assertTrue(all(item.toolTip() for item in workspace.fps_plot.plotItem.listDataItems()))
+        counts_before = [len(item.getData()[0]) for item in workspace.fps_plot.plotItem.listDataItems()]
+        workspace.fps_deviation_checkbox.setChecked(True)
+        self.application.processEvents()
+        self.assertEqual(workspace.fps_plot.plotItem.getAxis("left").labelText, "Deviation from run mean (%)")
+        self.assertEqual(
+            [len(item.getData()[0]) for item in workspace.fps_plot.plotItem.listDataItems()],
+            counts_before,
+        )
+        self.assertIn("Capture FPS", workspace.metric_cards["capture_fps"].title.text())
+        self.assertIn("Median Interval", workspace.metric_cards["median"].title.text())
         labels = [
             workspace.comparison_table.item(row, 0).text()
             for row in range(workspace.comparison_table.rowCount())
         ]
         self.assertIn("Capture FPS mean", labels)
         self.assertIn("Capture read failures", labels)
+        self.assertEqual(
+            [workspace.comparison_table.horizontalHeaderItem(i).text() for i in range(4)],
+            ["Metric", "Session A", "Session B", "B − A"],
+        )
+
+        primary_identity = workspace.session_a_combo.currentData()
+        comparison_identity = workspace.session_b_combo.currentData()
+        workspace.swap_button.click()
+        self.assertTrue(self._process_until(
+            lambda: workspace._primary is not None
+            and workspace._primary.option.session_id == comparison_identity[0]
+            and workspace._comparison is not None
+            and workspace._comparison.option.session_id == primary_identity[0]
+        ))
+        workspace.clear_comparison_button.click()
+        self.assertTrue(self._process_until(lambda: workspace._comparison is None))
+        self.assertIsNone(workspace.session_b_combo.currentData())
+
+        for width, height in ((1366, 768), (1920, 1080)):
+            workspace.resize(width, height)
+            self.application.processEvents()
+            scroll = workspace.findChild(QScrollArea)
+            self.assertIsNotNone(scroll)
+            self.assertGreater(scroll.viewport().width(), 0)
+            self.assertGreater(scroll.viewport().height(), 0)
+        workspace.close()
+
+    def test_filtering_and_empty_comparison_state(self) -> None:
+        second_session = SessionRecord(camera_id=None, label="Second camera mode", source="live_experiment")
+        self.database.create_session(second_session)
+        second_run = BenchmarkRecord(
+            session_id=second_session.id, label="640x480 MJPEG", status="completed",
+            configuration={"requested": {"width": 640, "height": 480, "pixel_format": "MJPG", "fps": 60}},
+        )
+        self.database.create_benchmark(second_run)
+        self.database.record_measurements_batch([
+            MeasurementSample(
+                benchmark_id=second_run.id, metric="frame_interval_ms", value=40.0,
+                unit="ms", stream_scope=StreamScope.CAPTURE, elapsed_seconds=0.04,
+                sample_index=1, interval_ns=40_000_000, method="synthetic second mode",
+            ),
+        ])
+        workspace = AnalysisWorkspace(self.database)
+        workspace.show()
+        self.assertTrue(self._process_until(lambda: workspace._primary is not None, timeout=5.0))
+        self.assertFalse(workspace.empty_state.isVisible())
+        self.assertEqual(workspace.session_b_combo.count(), 2)
+        workspace.camera_filter.setCurrentIndex(1)
+        self.assertEqual(workspace.session_a_combo.count(), 2)
+        mode_index = next(
+            index for index in range(1, workspace.mode_filter.count())
+            if "640×480" in workspace.mode_filter.itemText(index)
+        )
+        workspace.mode_filter.setCurrentIndex(mode_index)
+        self.assertEqual(workspace.session_a_combo.count(), 1)
+        fps_index = next(
+            index for index in range(1, workspace.fps_filter.count())
+            if workspace.fps_filter.itemData(index) == 60.0
+        )
+        workspace.fps_filter.setCurrentIndex(fps_index)
+        self.application.processEvents()
+        self.assertEqual(workspace.session_a_combo.count(), 1)
+        self.assertIn("640×480", workspace.session_a_combo.currentText())
+        workspace.search_edit.setText("no matching synthetic name")
+        self.application.processEvents()
+        self.assertEqual(workspace.session_a_combo.count(), 0)
+        self.assertIn("No experiments match", workspace.empty_state.text())
         workspace.close()
 
 

@@ -8,8 +8,10 @@ from pathlib import Path
 
 from camera_exploration_lab.analysis import (
     compare_methodology,
+    filter_experiments,
     list_experiments,
     load_analysis,
+    rate_deviation_percent,
 )
 from camera_exploration_lab.db import Database
 from camera_exploration_lab.models import (
@@ -242,6 +244,9 @@ class ExperimentAnalysisTests(unittest.TestCase):
         self.assertEqual(zero.interval_stats.minimum, 0.0)
         self.assertAlmostEqual(zero.capture_fps_stats.mean or 0.0, 200.0)
         self.assertAlmostEqual(zero.fps_points[0][1], 200.0)
+        self.assertEqual(zero.interval_histogram.zero_sample_count, 1)
+        self.assertEqual(zero.interval_histogram.positive_sample_count, 1)
+        self.assertAlmostEqual(sum(zero.interval_histogram.fractions), 1.0)
 
     def test_interrupted_session_and_read_failures_remain_interrupted(self) -> None:
         session_id, benchmark_id = self._create_live_run(
@@ -288,6 +293,49 @@ class ExperimentAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(slow.capture_fps_stats.mean or 0.0, 1000 / 16.6666666667, places=2)
         self.assertAlmostEqual(fast.capture_fps_stats.mean or 0.0, 1000 / 5.3333333333, places=1)
         self.assertGreater(fast.capture_fps_stats.mean or 0.0, slow.capture_fps_stats.mean or 0.0)
+
+    def test_experiment_filters_use_camera_mode_and_requested_fps(self) -> None:
+        slow_session, _ = self._create_live_run(
+            "PS3 Eye 60 FPS baseline", [16.7, 16.6], fps=60, reported_fps=60
+        )
+        self._create_live_run("PS3 Eye 187 FPS run", [5.3, 5.4], fps=187, reported_fps=187)
+        options = list_experiments(self.database)
+        slow = next(option for option in options if option.session_id == slow_session)
+        filtered = filter_experiments(
+            options,
+            camera_key=slow.camera_key,
+            mode_label=slow.mode_label,
+            requested_fps=60,
+            search="baseline",
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].session_id, slow_session)
+        self.assertEqual(filtered[0].requested_fps, 60.0)
+        self.assertIn("320×240", filtered[0].mode_label)
+        self.assertNotEqual(filtered[0].mode_label, "driver-reported 60 FPS")
+
+    def test_requested_mode_filters_fall_back_to_setting_snapshots(self) -> None:
+        session_id, benchmark_id = self._create_live_run(
+            "Snapshot-only requested mode", [16.7], fps=60, reported_fps=59.9
+        )
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE benchmark_runs SET configuration_json='{}' WHERE id=?",
+                (benchmark_id,),
+            )
+        option = next(o for o in list_experiments(self.database) if o.session_id == session_id)
+        self.assertEqual(option.requested_fps, 60.0)
+        self.assertIn("60 FPS requested", option.mode_label)
+
+    def test_normalized_rate_curve_preserves_samples_without_interpolation(self) -> None:
+        points = ((0.4, 60.0), (1.5, 66.0), (4.0, 54.0))
+        normalized = rate_deviation_percent(points, 60.0)
+        self.assertEqual(len(normalized), len(points))
+        self.assertEqual(tuple(x for x, _ in normalized), tuple(x for x, _ in points))
+        self.assertAlmostEqual(normalized[0][1], 0.0)
+        self.assertAlmostEqual(normalized[1][1], 10.0)
+        self.assertAlmostEqual(normalized[2][1], -10.0)
+        self.assertEqual(rate_deviation_percent(points, None), ())
 
     def test_large_series_is_bounded_and_preserves_global_outliers(self) -> None:
         session = SessionRecord(

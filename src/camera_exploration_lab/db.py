@@ -189,6 +189,24 @@ class Database:
         finally:
             connection.close()
 
+    @contextmanager
+    def connect_readonly(self) -> Iterator[sqlite3.Connection]:
+        """Open a query-only connection without creating or initializing a database."""
+        if self._memory_uri is not None:
+            connection = sqlite3.connect(self._memory_uri, uri=True)
+        else:
+            if not self.path.is_file():
+                raise FileNotFoundError(f"database does not exist: {self.path}")
+            connection = sqlite3.connect(f"{self.path.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA query_only = ON")
+        try:
+            connection.execute("BEGIN")
+            yield connection
+        finally:
+            connection.close()
+
     def close(self) -> None:
         """Release the keeper connection for an in-memory database."""
         if self._memory_anchor is not None:

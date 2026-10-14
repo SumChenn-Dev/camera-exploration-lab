@@ -4,7 +4,7 @@ Camera Exploration Lab is an offline-first Linux desktop workbench for discoveri
 
 ## Current scope
 
-Phase 2A provides:
+The current application includes:
 
 - Read-only V4L2 discovery with `/dev/v4l/by-id` identity preferred when available.
 - A preview-first Live Workbench for V4L2 cameras, with the preview occupying about two thirds of the primary area and persistent capture/preview diagnostics beside it.
@@ -12,10 +12,13 @@ Phase 2A provides:
 - Independent camera capture and GUI preview loops. Capture can run faster than the screen refresh without building a frame queue.
 - Fixed duration and manual experiment recording, with requested settings, driver readback, notes, timestamps, summary statistics, and raw timing samples stored in SQLite.
 - A History tab for local experiment sessions and imported CSV measurements.
+- An Analysis tab with a frame-interval timeline, a windowed capture-FPS curve, summary statistics, and a two-experiment comparison.
 
-Capture FPS, preview FPS, and future processing FPS are separate measurements. Frame arrival timestamps and intervals are host-side observations; they do not measure sensor-to-display latency. Raw video is not retained by the recorder.
+The Analysis tab can be opened from History with the Analyze selected button. It shows camera identity, capture settings, start time, duration, notes, capture and preview rates, frame intervals, failures, and the source of stored measurements. Compare mode overlays normalized interval distributions and shows delivered-rate, percentile, failure, and duration differences.
 
-Detailed analysis graphs, exports, extensive camera controls, and Canon CHDKPTP support are future work. The core application is for camera research. Specialized computer-vision experiments will use optional extension packages with their own dependencies and processing metrics. Wardrobe inventory is a separate application and is outside this project.
+Analysis distinguishes requested settings, driver readback, observed capture throughput, GUI preview cadence, and future processing throughput. Its FPS curve uses non-overlapping windows of recorded frame intervals (one second by default; longer windows for very long recordings). Imported or incomplete records may have summary-only values and are labeled accordingly. Frame-arrival timestamps are host observations after OpenCV returns; neither they nor frame intervals measure sensor exposure or sensor-to-display latency. Analysis opens SQLite read-only and does not change the local database. Raw video is not retained by the recorder.
+
+Exports, extensive camera controls, multi-camera recording, and Canon CHDKPTP support are future work. The core application is for camera research. Specialized computer-vision experiments will use optional extension packages with their own dependencies and processing metrics. Wardrobe inventory is a separate application and is outside this project.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the component boundaries and [docs/EXPLORATION_NOTEBOOK.md](docs/EXPLORATION_NOTEBOOK.md) for ongoing ideas, findings, and design decisions.
 The [development log](docs/DEVELOPMENT_LOG.md) summarizes completed milestones. See the [Konsole development workflow](docs/DEVELOPMENT_WORKFLOW.md) for tests, read-only release review, and deliberate GitHub publication. The [initial snapshot audit](docs/PUBLICATION_AUDIT.md) documents the separate one-time privacy check.
@@ -106,6 +109,12 @@ VENV="$HOME/.local/share/camera-exploration-lab/venv"
 ```
 
 The importer reads the source files without moving or editing them. Reimporting the same unchanged file is idempotent.
+
+## Inspect and compare saved experiments
+
+Launch Camera Exploration Lab through the KDE launcher, or use the existing virtual environment and the same database argument already configured in the launcher. In History, select a saved run and choose Analyze selected, or open Analysis and select a run directly. Choose a second run in Compare with to see the interval-distribution overlay and metric table.
+
+For host visual review, check the timeline units and displayed interval count against the selected run, compare capture and preview rates separately, and confirm that requested and driver-reported modes remain distinct. A raw interval plot may be unavailable for summary-only imports; those records show stored fields without reconstructing samples. Analysis uses a read-only database connection and leaves the existing history file in place.
 
 ## Tests
 

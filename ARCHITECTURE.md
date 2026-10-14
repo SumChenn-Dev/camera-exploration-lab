@@ -6,7 +6,8 @@
 PySide6 desktop shell
     ├── Live Workbench (preview + persistent performance panel)
     ├── History (experiments and imported measurements)
-    ├── Analysis / Exports (future tabs)
+    ├── Analysis (read-only timing analysis and two-run comparison)
+    ├── Exports (future tab)
     ├── camera backend boundary
     │     ├── V4L2/OpenCV capture worker (implemented)
     │     └── CHDKPTP process adapter (future)
@@ -14,6 +15,7 @@ PySide6 desktop shell
           ├── camera discovery and identity registry
           ├── independent capture / preview / processing stages
           ├── bounded experiment recorder
+          ├── asynchronous experiment analysis
           └── SQLite repository and CSV importer
 ```
 
@@ -28,8 +30,8 @@ Specialized computer-vision experiments should be optional extensions. An extens
 | Data models, CSV, logs, CLI | Python standard library | Implemented |
 | Storage | Python `sqlite3` | Implemented; schema version 2 adds summaries and indexes |
 | V4L2 discovery | `/sys/class/video4linux`, `/dev/v4l/by-id` | Implemented read-only |
-| Desktop | PySide6 | Optional `desktop` extra; Live Workbench and History implemented |
-| Graphs | PyQtGraph | Optional `desktop` extra; detailed graph views are future work |
+| Desktop | PySide6 | Optional `desktop` extra; Live Workbench, History, and Analysis implemented |
+| Graphs | PyQtGraph | Optional `desktop` extra; interval/FPS plots and interval-distribution comparison implemented |
 | Frame capture and processing | NumPy + `opencv-python-headless` | Optional `desktop` extra; V4L2 capture worker implemented |
 | Canon remote control | CHDKPTP process adapter | Future backend; no Canon control is part of this phase |
 
@@ -66,8 +68,20 @@ Schema version 2 adds the summary table and indexes without rewriting earlier im
 
 The local database can contain camera serial numbers, machine-specific source paths, experiment names, and notes. It is user data and must not be committed or shared without review. New local databases default to the XDG data directory. Source CSV files are read in place; the importer checks that a file's content hash is stable during import and commits one source atomically.
 
+## Historical analysis
+
+The Analysis workspace reads the existing schema version 2 through a SQLite URI opened in read-only mode with query-only enabled. It does not initialize or migrate the database, and Phase 2B adds no schema changes. A dedicated Qt worker performs the queries so larger histories do not block the event loop.
+
+The interval timeline uses persisted capture-scoped frame_interval_ms values, falling back to interval nanoseconds on frame_arrival rows when needed. When recorder elapsed values are present they supply the horizontal coordinate; otherwise the chart uses cumulative persisted intervals and says so on the axis. The first interval can be absent when recording began during preview because its earlier endpoint may be outside the experiment boundary.
+
+Frame-interval min, max, mean, median, p95, and p99 are calculated from stored sample values. The median averages the two center values for an even sample count; p95 and p99 use the nearest-rank rule, ceil(p × n). The FPS curve groups interval endpoints into non-overlapping windows. Each point is the number of recorded interval transitions divided by their summed duration in that window; the target width is one second and widens for very long runs to keep the plotted curve bounded. A window containing only zero-duration intervals has no defined rate. Mean delivered capture FPS is derived from all persisted intervals when available. If raw intervals are absent, only explicitly capture-scoped saved FPS samples or the saved run summary are used.
+
+Requested driver frame rate, driver-reported rate, observed capture rate, GUI preview rate, and processing rate remain separate. The curve estimates host frame-arrival throughput. Recorded UTC timestamps are taken after OpenCV read returns, and intervals use host monotonic time; neither reveals sensor exposure timing, cross-camera synchronization, or sensor-to-display latency.
+
+Chart data is streamed from SQLite and reduced to per-bucket minima and maxima, retaining visible spikes and global extrema with a fixed point budget. Percentiles are queried exactly from SQLite. Imported or incomplete histories may have only per-row legacy fields or saved summaries; the UI identifies stored summary fields and does not draw a raw timeline where raw intervals are absent.
+
 ## Bazzite packaging and launch
 
 Install the desktop extra into a per-user virtual environment. The Qt application runs on the KDE host and reads host V4L2 devices. Do not install application dependencies into the immutable host image for this project. For offline setup, build and retain a wheelhouse for the target Python version and architecture, then install with pip's `--no-index` option. The tested launcher instructions are in [README.md](README.md).
 
-The Live Workbench gives roughly 65–70% of the main area to preview and keeps capture FPS, preview FPS, frame interval, read failures, and settings visible in a persistent side panel. Recording status and progress stay in the workbench. History has its own tab. Graphs, comparisons, and exports remain future tabs.
+The Live Workbench gives roughly 65–70% of the main area to preview and keeps capture FPS, preview FPS, frame interval, read failures, and settings visible in a persistent side panel. Recording status and progress stay in the workbench. History and Analysis have their own tabs; a selected History run can open directly in Analysis. Exports remain future work.

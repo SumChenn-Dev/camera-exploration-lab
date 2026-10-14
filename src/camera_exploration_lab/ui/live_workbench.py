@@ -40,6 +40,7 @@ from ..db import Database
 from ..discovery import V4L2Discovery
 from ..models import CameraCandidate, utc_now_iso
 from ..recording import ExperimentRecorder, RecordingSnapshot, RecordingState
+from .analysis_workspace import AnalysisWorkspace
 
 logger = logging.getLogger(__name__)
 
@@ -141,9 +142,8 @@ class LiveWorkbenchWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
         self.tabs.addTab(self._build_live_tab(), "Live Workbench")
         self.tabs.addTab(self._build_history_tab(), "History")
-        self.tabs.addTab(self._build_placeholder_tab(
-            "Live analysis", "Tracking, motion analysis, digital zoom, and image processing will be added here."
-        ), "Analysis")
+        self.analysis_workspace = AnalysisWorkspace(self._database)
+        self.tabs.addTab(self.analysis_workspace, "Analysis")
         self.tabs.addTab(self._build_placeholder_tab(
             "Exports", "Session summaries and raw CSV/JSON exports will be added here."
         ), "Exports")
@@ -338,8 +338,12 @@ class LiveWorkbenchWindow(QMainWindow):
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
         self.history_refresh_button = QPushButton("Refresh")
         self.history_refresh_button.clicked.connect(self.refresh_history)
+        self.analyze_history_button = QPushButton("Analyze selected")
+        self.analyze_history_button.setToolTip("Open the selected history run in the Analysis workspace.")
+        self.analyze_history_button.clicked.connect(self._analyze_selected_history)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.analyze_history_button)
         header.addWidget(self.history_refresh_button)
         layout.addLayout(header)
 
@@ -392,6 +396,19 @@ class LiveWorkbenchWindow(QMainWindow):
     def _tab_changed(self, index: int) -> None:
         if self.tabs.tabText(index) == "History":
             self.refresh_history()
+        elif self.tabs.tabText(index) == "Analysis":
+            self.analysis_workspace.refresh_experiments()
+
+    def _analyze_selected_history(self) -> None:
+        row = self.history_table.currentRow()
+        first_cell = self.history_table.item(row, 0) if row >= 0 else None
+        selection = first_cell.data(Qt.ItemDataRole.UserRole) if first_cell else None
+        if not selection:
+            self.history_details.setPlainText("Select a history row before opening Analysis.")
+            return
+        session_id, benchmark_id = selection
+        self.analysis_workspace.select_experiment(session_id, benchmark_id)
+        self.tabs.setCurrentWidget(self.analysis_workspace)
 
     def refresh_history(self) -> None:
         if not hasattr(self, "history_table"):

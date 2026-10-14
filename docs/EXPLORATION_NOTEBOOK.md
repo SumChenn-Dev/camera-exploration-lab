@@ -20,6 +20,7 @@ The original private development history contains three completed milestones. Th
 | Phase 0 — Foundation | SQLite schema, camera discovery model, historical CSV importer, session data model, logging, and camera-independent tests. | Automated tests use synthetic records and temporary databases. |
 | Phase 1 — Live Workbench | Preview-first PySide6 workbench, independent capture and preview loops, persistent metric labels, and V4L2 mode/readback display. | Mocked tests and host capture checks with two native USB cameras. |
 | Phase 2A — Experiment recording | Timed and manual sessions, notes, bounded streaming timing storage, SQLite summaries, and a basic History view. | Automated tests passed; a completed physical recording was inspected in History. Detailed run values remain in the local database. |
+| Phase 2B — Experiment analysis | Read-only Analysis workspace with a frame-interval timeline, windowed capture-FPS curve, summaries, and two-run comparison. | Synthetic tests cover timing math, imported/interrupted records, bounded plots, query-only reads, and History navigation; host visual review remains pending. |
 
 ## Confirmed discoveries and design decisions
 
@@ -31,6 +32,8 @@ The original private development history contains three completed milestones. Th
 | Preserve requested settings separately from driver-reported and verified settings. | A request is not evidence that the driver accepted the value. |
 | Preserve raw source rows alongside normalized historical measurements. | Later analysis needs both the original input and normalized fields. |
 | Exclude a recording's first interval when it began before the recording boundary. | That interval does not describe two arrivals within the experiment. |
+| Analyze history through a query-only connection and stream plot samples into min/max buckets. | Analysis must not alter research data, freeze the UI, or erase timing spikes during visual downsampling. |
+| Show imported summary fields as stored values when raw intervals are absent. | Legacy history does not always support recalculating a complete distribution. |
 | Treat local databases and logs as user data. | They can contain camera identity, paths, experiment names, notes, and imported records. |
 | Keep computer-vision prototypes optional and wardrobe inventory separate. | These workflows need different dependencies, interfaces, and privacy boundaries. |
 
@@ -39,7 +42,8 @@ The original private development history contains three completed milestones. Th
 | ID | Idea | Area | Status | Next evidence needed |
 | --- | --- | --- | --- | --- |
 | CEL-001 | Harden recording across manual stop, disconnect/reconnect, and restart recovery. | Core | Implemented; more physical cases pending | Compare visible status with persisted session state for each case. |
-| CEL-002 | Add graphs, comparisons, and annotated exports. | Core | Planned | Rebuild charts from stored measurements while keeping capture and preview series separate. |
+| CEL-013 | Record concurrent multi-camera experiments with per-camera timing and failure state. | Core (future) | High-priority upcoming milestone | Validate independent stream delivery, per-camera configuration, host-arrival timing, and interruption behavior; do not imply hardware synchronization. |
+| CEL-002 | Add graphs, comparisons, and annotated exports. | Core | Analysis and comparison implemented in Phase 2B; exports planned | Visually review saved and imported runs on Bazzite; later define exports that preserve raw timestamps and units. |
 | CEL-003 | Add capability-driven exposure and gain controls with readback. | Core | Planned | Probe supported ranges and verify safe failure and restart behavior per device. |
 | CEL-004 | Compare camera modes and controlled environmental conditions. | Research | Proposed | Repeat runs with recorded lighting, exposure, focus, and lens position. |
 | CEL-005 | Add a bounded optional processing-stage prototype. | Extension | Proposed | Show that sampling and analysis do not slow capture; report processing FPS separately. |
@@ -50,7 +54,6 @@ The original private development history contains three completed milestones. Th
 | CEL-010 | Add a CHDKPTP adapter and optical zoom experiments. | Optional backend | Deferred | Define mockable process boundaries, timeouts, and bounded camera movement first. |
 | CEL-011 | Create a private wardrobe catalog and outfit-planning application. | Separate application | Idea | Define its own data model, storage, and image review flow. |
 | CEL-012 | Derive controlled experiment conclusions from repeatable evidence. | Research practice | Proposed | Define what result, uncertainty, and conditions support each conclusion. |
-| CEL-013 | Record concurrent multi-camera experiments with per-camera timing and failure state. | Core (future) | Planned | Validate independent stream delivery, per-camera configuration, host-arrival timing, and interruption behavior; do not imply hardware synchronization. |
 
 ## Simultaneous V4L2 capture observations
 
@@ -62,6 +65,15 @@ The original private development history contains three completed milestones. Th
 - Evidence: physical concurrent-capture tests. No measurable average-FPS degradation was observed in the tested modes.
 - Limitations: these tests confirmed simultaneous frame delivery only. They did not measure cross-camera synchronization, stereo-tracking accuracy, or absolute sensor latency.
 - Follow-up: add future multi-camera experiment recording with separate per-camera settings, host arrival timestamps, and failure reporting. This is roadmap work; no multi-camera recorder is implemented.
+
+### 2026-10-13 — 12-minute concurrent V4L2 throughput observation
+
+- Kind: observation
+- Context: two native USB cameras captured concurrently on the Bazzite host for 720 seconds.
+- Finding or choice: PS3 Eye at 320×240 GRBG delivered approximately 187.35 FPS while the AVerMedia CAM 313 at 1920×1080 MJPEG delivered approximately 23.91 FPS. Both streams reached the expected timeout without matching reported streaming errors.
+- Evidence: host-side V4L2 capture observation. This supports sustained concurrent capture throughput for the tested modes.
+- Limitations: no hardware synchronization, cross-camera timing accuracy, stereo-tracking accuracy, or absolute sensor latency was measured. Values are sanitized observations; raw logs and run records remain local.
+- Follow-up: keep CEL-013 as the high-priority upcoming milestone and record future multi-camera runs with separate per-camera timing and failure state.
 
 ## Multi-camera experiment outline
 

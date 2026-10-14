@@ -233,6 +233,63 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
         self.assertIn("Wait for camera", window.recording_status.text())
         window.close()
 
+    def test_history_row_opens_the_same_run_in_analysis(self) -> None:
+        session = SessionRecord(
+            camera_id=None,
+            label="Imported navigation fixture",
+            source="imported",
+            started_at="2026-10-13T12:00:00+00:00",
+        )
+        self.database.create_session(session)
+        benchmark = BenchmarkRecord(
+            session_id=session.id,
+            label="Legacy 320x240",
+            status="imported",
+            configuration={"legacy_mode": "320x240"},
+        )
+        self.database.create_benchmark(benchmark)
+        self.database.record_measurements_batch([
+            MeasurementSample(
+                benchmark_id=benchmark.id,
+                metric="capture_frame_interval_ms",
+                value=8.0,
+                unit="ms",
+                stream_scope=StreamScope.CAPTURE,
+                sample_index=1,
+                method="legacy_csv:interval_ms",
+            ),
+            MeasurementSample(
+                benchmark_id=benchmark.id,
+                metric="capture_frame_interval_ms",
+                value=9.0,
+                unit="ms",
+                stream_scope=StreamScope.CAPTURE,
+                sample_index=2,
+                method="legacy_csv:interval_ms",
+            ),
+        ])
+        window = LiveWorkbenchWindow(SyntheticDiscovery(), self.database)
+        window.refresh_history()
+        self.assertEqual(window.history_table.rowCount(), 1)
+        window.history_table.selectRow(0)
+        window.analyze_history_button.click()
+
+        self.assertEqual(window.tabs.currentWidget(), window.analysis_workspace)
+        self.assertTrue(self._process_until(
+            lambda: window.analysis_workspace._primary is not None
+            and window.analysis_workspace._primary.option.session_id == session.id
+        ))
+        self.assertEqual(
+            window.analysis_workspace.experiment_combo.currentData(),
+            (session.id, benchmark.id),
+        )
+        self.assertEqual(
+            window.analysis_workspace._primary.interval_stats.count,
+            2,
+        )
+        self.assertEqual(len(window.analysis_workspace.interval_plot.plotItem.listDataItems()), 1)
+        window.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

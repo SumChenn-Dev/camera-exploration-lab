@@ -1,6 +1,6 @@
 # Development Log
 
-This log summarizes the three completed local milestones. It describes delivered behavior and verification without embedding per-run measurements or local development history in the public snapshot.
+This log records completed engineering milestones and the public repository setup. It avoids including individual experiment measurements or local database contents.
 
 ## Phase 0 — Project foundation
 
@@ -21,9 +21,19 @@ This log summarizes the three completed local milestones. It describes delivered
 - Added migration and recording tests using synthetic timings and temporary databases. The 39-test suite passed during Phase 2A review.
 - A completed physical recording was inspected in History while live preview continued. Detailed measurements remain in the local experiment database.
 
-## Public snapshot preparation
+## First public repository
 
-The first public candidate is assembled from an explicit reviewed file list and has an independent initial commit. The original three-commit development history and local experiment data remain in the original working repository; neither is copied into this snapshot.
+- Published an independent, privacy-reviewed initial snapshot on GitHub. The public checkout starts from its own root commit and does not contain the original private development history.
+- The public checkout is the canonical location for future development. The original checkout and its three-milestone history remain preserved separately.
+- Local databases, backups, imported measurements, and captured media remain outside Git tracking.
+- Future commits require file, history, identity, and privacy review before publication. The read-only review command and camera-free Actions workflow are documented in [Development Workflow](DEVELOPMENT_WORKFLOW.md).
+
+## Verified Bazzite public-checkout transition
+
+- Confirmed the public remote and local checkout at the initial public commit before the transition.
+- Repointed and verified the existing editable install to the canonical public checkout; dependency checks passed.
+- Verified the KDE launcher opens the workbench with the existing research database, both webcams are discoverable and preview successfully, and earlier History records remain visible.
+- The original private checkout and database remain preserved. No camera controls or private data were changed or copied into this repository.
 
 ## Known follow-up work
 

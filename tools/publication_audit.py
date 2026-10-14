@@ -18,8 +18,18 @@ DATA_SUFFIXES = {
     ".sqlite", ".sqlite3", ".db", ".csv", ".json", ".jsonl", ".log",
     ".bak", ".backup", ".wal", ".shm", ".jpg", ".jpeg", ".png",
     ".gif", ".webp", ".tif", ".tiff", ".bmp", ".mp4", ".mov", ".avi",
-    ".mkv", ".webm",
+    ".mkv", ".webm", ".sqlite-wal", ".sqlite3-wal", ".db-wal",
+    ".sqlite-shm", ".sqlite3-shm", ".db-shm", ".sqlite-journal",
+    ".sqlite3-journal", ".db-journal",
 }
+
+
+def _is_data_path(relative: str) -> bool:
+    """Match regular data suffixes and SQLite sidecar suffixes."""
+    name = Path(relative).name.lower()
+    return any(name.endswith(suffix) for suffix in DATA_SUFFIXES)
+
+
 SENSITIVE_NAMES = {".env", ".env.local", "id_rsa", "id_ed25519", "credentials"}
 
 EMAIL_RE = re.compile(
@@ -234,7 +244,7 @@ def _scan_paths(
             continue
         if path.name.lower() in SENSITIVE_NAMES:
             findings.append(Finding("sensitive filename", relative))
-        if path.suffix.lower() in DATA_SUFFIXES:
+        if _is_data_path(relative):
             findings.append(Finding("experiment or media file", relative))
         file_findings, binary = _scan_file(root, relative, sensitive_terms)
         findings.extend(file_findings)

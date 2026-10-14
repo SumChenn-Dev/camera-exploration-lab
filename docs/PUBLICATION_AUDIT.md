@@ -1,6 +1,6 @@
 # Local publication audit
 
-`tools/publication_audit.py` is a read-only-by-default pre-publication check. It prints the public tree manifest, file sizes and SHA-256 hashes, Git state, commit identities, remotes, and likely privacy or packaging findings. It does not modify files, create commits, configure remotes, create a GitHub repository, or publish anything.
+`tools/publication_audit.py` is a read-only-by-default check for the original one-commit public snapshot. It expects a standalone snapshot without a remote, so it is not the recurring audit for the published checkout. Use `tools/review_release.py` for ongoing review of the public repository. It prints the public tree manifest, file sizes and SHA-256 hashes, Git state, commit identities, remotes, and likely privacy or packaging findings. It does not modify files, create commits, configure remotes, create a GitHub repository, or publish anything.
 
 Run it from a trusted local checkout, passing the original development tree and the separately prepared public snapshot:
 
@@ -27,4 +27,4 @@ An exit status of `0` means the automated checks found no configured release blo
 
 Automated scanning cannot guarantee privacy. Review the complete manifest, source and test contents, documentation, images or other attachments, Git metadata, and the exact ref that would be pushed. A scanner can miss names or identifiers expressed indirectly, and it can flag synthetic examples that need human classification. Do not upload experiment databases, logs, exports, screenshots, images, or video without an explicit privacy review.
 
-The command is intentionally local and read-only. GitHub repository creation, remote configuration, first push, and releases require separate explicit authorization.
+The command is intentionally local and read-only. The initial repository and snapshot are already published. Every later push or release requires separate explicit authorization of the exact commit and destination.

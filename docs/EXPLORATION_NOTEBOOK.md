@@ -13,7 +13,7 @@ The core records capture, preview, and future processing rates as separate measu
 
 ## Completed development milestones
 
-The local development history contains three completed milestones. The public snapshot is prepared with its own clean initial commit, so it does not carry the private development history.
+The original private development history contains three completed milestones. The public repository starts from a separate root commit and is the canonical checkout for future work; the original history remains preserved locally.
 
 | Milestone | Outcome | Evidence |
 | --- | --- | --- |
@@ -50,6 +50,18 @@ The local development history contains three completed milestones. The public sn
 | CEL-010 | Add a CHDKPTP adapter and optical zoom experiments. | Optional backend | Deferred | Define mockable process boundaries, timeouts, and bounded camera movement first. |
 | CEL-011 | Create a private wardrobe catalog and outfit-planning application. | Separate application | Idea | Define its own data model, storage, and image review flow. |
 | CEL-012 | Derive controlled experiment conclusions from repeatable evidence. | Research practice | Proposed | Define what result, uncertainty, and conditions support each conclusion. |
+| CEL-013 | Record concurrent multi-camera experiments with per-camera timing and failure state. | Core (future) | Planned | Validate independent stream delivery, per-camera configuration, host-arrival timing, and interruption behavior; do not imply hardware synchronization. |
+
+## Simultaneous V4L2 capture observations
+
+### 2026-10-13 — PS3 Eye and AVerMedia concurrent delivery
+
+- Kind: observation
+- Context: both USB cameras captured concurrently on the Bazzite host through V4L2.
+- Finding or choice: PS3 Eye at 640×480 / 60 FPS with AVerMedia CAM 313 at 720p MJPEG delivered average capture rates of 60.02 FPS and 23.91 FPS respectively; this configuration was repeated twice. PS3 Eye at 320×240 / 187 FPS with the AVerMedia at 1080p MJPEG delivered average capture rates of 187.35 FPS and 23.91 FPS respectively.
+- Evidence: physical concurrent-capture tests. No measurable average-FPS degradation was observed in the tested modes.
+- Limitations: these tests confirmed simultaneous frame delivery only. They did not measure cross-camera synchronization, stereo-tracking accuracy, or absolute sensor latency.
+- Follow-up: add future multi-camera experiment recording with separate per-camera settings, host arrival timestamps, and failure reporting. This is roadmap work; no multi-camera recorder is implemented.
 
 ## Multi-camera experiment outline
 
@@ -70,10 +82,18 @@ A private-first wardrobe catalog could support garment photos, editable categori
 ## Privacy and publication decisions
 
 - The public snapshot excludes experiment databases, raw imports and exports, captured media, ignored data, and the original local commit history.
-- The proposed license is MIT with `SumChenn-Dev` as the copyright holder, pending owner review.
+- The published license is MIT with `SumChenn-Dev` as the copyright holder; see [LICENSE](../LICENSE).
 - Automated scanning is a useful filter, not a privacy guarantee. Review every proposed file, line of history, fixture, and generated manifest before any upload.
-- No repository, remote, release, or first push is authorized by preparing this snapshot. Publish only after explicit approval of the exact tree and commands.
+- The first public snapshot is published. Each later push requires review of the exact outgoing diff, commit identity, destination, and commit hash, followed by explicit owner approval.
 - A consequential experiment should record an actionable conclusion only when its setup, evidence, and limitations support that conclusion.
+
+### 2026-10-13 — Public checkout and local data boundary
+
+- Kind: decision
+- Context: the first standalone public snapshot is published and the public checkout is the canonical development location.
+- Finding or choice: retain the original private checkout and its history; keep experiment databases and backups ignored and local; pass the existing database path explicitly when launching the app.
+- Evidence: Bazzite host verified the public remote at the initial commit, editable-install source, dependency health, KDE launcher, both webcam previews, and existing History records. The original private checkout and database remain in place.
+- Follow-up: keep publication audits local and review every outgoing diff, commit identity, and destination before a separately authorized push.
 
 ## Open questions
 

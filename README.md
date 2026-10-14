@@ -18,21 +18,28 @@ Capture FPS, preview FPS, and future processing FPS are separate measurements. F
 Detailed analysis graphs, exports, extensive camera controls, and Canon CHDKPTP support are future work. The core application is for camera research. Specialized computer-vision experiments will use optional extension packages with their own dependencies and processing metrics. Wardrobe inventory is a separate application and is outside this project.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the component boundaries and [docs/EXPLORATION_NOTEBOOK.md](docs/EXPLORATION_NOTEBOOK.md) for ongoing ideas, findings, and design decisions.
-The [development log](docs/DEVELOPMENT_LOG.md) summarizes completed milestones. The local [publication audit](docs/PUBLICATION_AUDIT.md) documents the read-only privacy and release-tree check.
+The [development log](docs/DEVELOPMENT_LOG.md) summarizes completed milestones. See the [Konsole development workflow](docs/DEVELOPMENT_WORKFLOW.md) for tests, read-only release review, and deliberate GitHub publication. The [initial snapshot audit](docs/PUBLICATION_AUDIT.md) documents the separate one-time privacy check.
 
 ## Install on Bazzite
 
-Use a virtual environment in the current user's data area. This leaves the immutable host image and other containers unchanged. Run these commands from the project checkout:
+The canonical Bazzite checkout is `$HOME/Documents/Codex/Camera-Exploration-Lab-public-snapshot`. The existing host setup has been verified against this public checkout, including its editable Python install and KDE launcher. For a new machine, clone the public repository there and run the fresh setup below. Do not recreate the verified host's virtual environment as part of normal development.
+
+```bash
+git clone https://github.com/SumChenn-Dev/camera-exploration-lab.git \
+  "$HOME/Documents/Codex/Camera-Exploration-Lab-public-snapshot"
+cd "$HOME/Documents/Codex/Camera-Exploration-Lab-public-snapshot"
+```
+
+For a fresh Bazzite setup, use a virtual environment in the current user's data area. This leaves the immutable host image and other containers unchanged:
 
 ```bash
 VENV="$HOME/.local/share/camera-exploration-lab/venv"
 python3 -m venv "$VENV"
 "$VENV/bin/python" -m pip install --upgrade pip
 "$VENV/bin/python" -m pip install -e ".[desktop]"
-"$VENV/bin/celab" gui
 ```
 
-The optional `desktop` extra provides PySide6, PyQtGraph, NumPy, and `opencv-python-headless`. Camera discovery and the data model use the Python standard library and SQLite. No `sudo pip`, host package installation, or container configuration is needed.
+The optional `desktop` extra provides PySide6, PyQtGraph, NumPy, and `opencv-python-headless`. Camera discovery and the data model use the Python standard library and SQLite. No sudo pip, host package installation, or container configuration is needed.
 
 ### Offline installation
 
@@ -62,31 +69,33 @@ Keep the wheelhouse and its checksum file with the setup notes. Rebuild it only 
 
 ## KDE launcher
 
-After installation, create a per-user KDE application entry. This writes only to the current user's application directory:
+For a fresh installation, create a per-user KDE application entry. Choose a new database path for a new history, or set DATABASE to an existing local history database if you are continuing earlier experiments. Keep that file and its backups in place; do not copy them into the checkout. The verified Bazzite launcher already passes the existing database path.
 
 ```bash
 VENV="$HOME/.local/share/camera-exploration-lab/venv"
 APP_DIR="$HOME/.local/share/applications"
-mkdir -p "$APP_DIR"
+DATABASE="${XDG_DATA_HOME:-$HOME/.local/share}/camera-exploration-lab/history.sqlite3"
+mkdir -p "$APP_DIR" "$(dirname "$DATABASE")"
 cat > "$APP_DIR/camera-exploration-lab.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Camera Exploration Lab
 Comment=Discover cameras and record capture experiments
-Exec="$VENV/bin/celab" gui
+Exec="$VENV/bin/celab" --database "$DATABASE" gui
+Path=$HOME/Documents/Codex/Camera-Exploration-Lab-public-snapshot
 Terminal=false
 Categories=Science;Utility;
 EOF
 chmod 644 "$APP_DIR/camera-exploration-lab.desktop"
 ```
 
-The app reads host V4L2 devices directly. Use `celab scan-v4l2` from the virtual environment to inspect discovered endpoints before opening the GUI.
+If you already have a working launcher, leave its `--database` argument unchanged. For a manual launch of the same history, use `celab --database "$DATABASE" gui` with that existing database path. The app reads host V4L2 devices directly; use `celab scan-v4l2` from the virtual environment to inspect discovered endpoints.
 
 ## Local data and privacy
 
 By default, the SQLite history is stored under `$XDG_DATA_HOME/camera-exploration-lab/history.sqlite3`, or `~/.local/share/camera-exploration-lab/history.sqlite3` when `XDG_DATA_HOME` is unset. Logs are stored under `$XDG_STATE_HOME/camera-exploration-lab/` or `~/.local/state/camera-exploration-lab/`.
 
-The database may contain camera serial numbers, local source paths, experiment names, and notes. Keep databases, backups, CSV/JSON exports, captured images, and other experiment outputs in ignored local data directories. Review and redact any database or log before sharing it. The application does not upload data.
+The database may contain camera serial numbers, local source paths, experiment names, and notes. Keep databases, backups, CSV/JSON exports, captured images, and other experiment outputs in ignored local data directories. Preserve an existing research database at its current location and pass that same path with `--database`; do not move it into the checkout. Review and redact any database or log before sharing it. The application does not upload data.
 
 To import a CSV file or directory into a selected local database:
 
@@ -103,8 +112,9 @@ The importer reads the source files without moving or editing them. Reimporting 
 Tests use synthetic timings, generated CSVs, temporary SQLite databases, and mocked cameras. They do not require a connected camera:
 
 ```bash
-cd /path/to/Camera-Exploration-Lab
-PYTHONPATH=src QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v -s tests
+cd "$HOME/Documents/Codex/Camera-Exploration-Lab-public-snapshot"
+VENV="$HOME/.local/share/camera-exploration-lab/venv"
+PYTHONPATH=src QT_QPA_PLATFORM=offscreen "$VENV/bin/python" -m unittest discover -v -s tests
 ```
 
 Physical verification must run in a Bazzite KDE host session, since a container or sandbox may not have access to `/dev/video*`:
@@ -112,11 +122,14 @@ Physical verification must run in a Bazzite KDE host session, since a container 
 ```bash
 VENV="$HOME/.local/share/camera-exploration-lab/venv"
 "$VENV/bin/celab" scan-v4l2
-"$VENV/bin/celab" gui
+LAUNCHER="$HOME/.local/share/applications/camera-exploration-lab.desktop"
+DATABASE="$(sed -n 's/.*--database "\([^"]*\)".*/\1/p' "$LAUNCHER")"
+test -n "$DATABASE"
+"$VENV/bin/celab" --database "$DATABASE" gui
 ```
 
 In the Live Workbench, select a camera and mode, start preview, and check the driver-reported settings. Start a 10, 30, 60, or 120 second experiment and confirm that the preview continues while recording. Then inspect the result and any imported sessions in History. Do not treat read duration or frame interval as sensor latency.
 
 ## Contributing and license
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for scope, test, and data-handling guidance. The proposed license is [MIT](LICENSE), prepared for project-owner review before publication.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for scope, test, and data-handling guidance. The project is distributed under the [MIT License](LICENSE), with SumChenn-Dev as the copyright holder.

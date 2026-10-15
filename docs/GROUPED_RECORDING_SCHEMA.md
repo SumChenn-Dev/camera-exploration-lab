@@ -75,9 +75,9 @@ GroupedExperimentRepository provides:
 - increment_stream_counters and mark_stream_incomplete: retain separate observation/loss counts and integrity state.
 - record_stream_measurements: validates child association, bounded batch size, integer timing and increasing sequence/time; it uses the existing DB batch insertion helper.
 - add_event: stores structured reason codes/details.
-- acquire_recording_lease and release_recording_lease: model one writer owner and verify release token.
+- acquire_recording_lease and release_recording_lease: model one writer owner and verify release token. Grouped writes validate that lease's session and owner token within an immediate write transaction. Successful finalization can release the matching lease in the same transaction.
 
-The APIs are not connected to a worker, GUI, or persistent service. A local lease row is not sufficient by itself to claim enforcement; all recording entry points must use it in a future stage. Stale lease recovery must verify PID plus process-start identity and must not steal a live process’s lease.
+The synthetic coordinator now uses these APIs, but they remain unconnected to a capture worker or GUI. The v2 single-camera recorder does not participate in this v3 lease, so current lease enforcement is not end-to-end for a shared production database. Stale lease recovery is not implemented and no lease is automatically stolen based on age.
 
 ## Query/index policy
 
@@ -102,6 +102,12 @@ With 100 metadata-only groups added, `list_groups(limit=1000)` returned all 101 
 
 The 150–300 B/row calculation is retained in benchmark output only as a comparison baseline. It is not a sizing guarantee. The 100 metadata-only rows are excluded from the reported measurement-bearing file size but included in History query timing.
 
-## Pass 2B remains separate
+## CEL-013 Pass 2B.1 synthetic coordinator
 
-The coordinator will own a bounded queue per stream and a single SQLite writer. Capture callbacks will use only nonblocking enqueue; rejected events increment stream-local loss counters, preserve sequence gaps, and permanently flag data incomplete while future samples continue to be offered. A database failure affects persistence for both streams but must not silently stop capture or be mislabeled as a camera drop. Queue sizes, batch cadence, retry policy, UI feedback and crash recovery still require coordinator implementation and tests.
+The camera-free `GroupedRecordingCoordinator` uses bounded queue capacity per stream, fair bounded batches, and one SQLite writer. Capture-side submission is nonblocking; rejected records increment stream-local loss totals and assigned arrival sequences preserve gaps. Later offers resume when queue space returns. Writer failure is terminal, counts accepted but uncommitted records as persistence loss, makes one best-effort incomplete marker, and prevents successful finalization. Successful finalization and lease release are atomic. No SQLite WAL policy or runtime dependency was added.
+
+The coordinator is not attached to live workers, normal application startup, History, Analysis, or GUI controls. It accepts synthetic timing events only. The ordinary `Database.initialize()` path remains schema v2 and does not invoke the synthetic v3 migration. The existing single-camera recorder does not acquire the v3 lease, so concurrent use of those two paths against one production database is unsupported until a later reviewed ownership integration. A stale lease blocks another grouped writer; there is no automatic recovery or lease takeover.
+
+Synthetic coordinator throughput, batch-size comparison, queue limits, transaction failures, lifecycle tests, and limitations are documented in [Grouped Recording Coordinator](GROUPED_RECORDING_COORDINATOR.md). Results from `tools/benchmark_grouped_schema.py` above are the earlier repository-level Pass 2A persistence benchmark; they are not coordinator results. The coordinator benchmarks also use temporary marked synthetic databases, not cameras or user history.
+
+Live capture integration, sharing the lease with the existing single-camera recorder, crash classification/recovery, multi-camera UI, grouped History/Analysis, and physical validation remain later stages. Physical validation of CEL-013 Pass 1 must precede work that relies on live dual-camera concurrency.

@@ -407,6 +407,30 @@ class GroupedExperimentRepository:
             )
 
     @staticmethod
+    def _require_lease_owner(
+        connection: sqlite3.Connection,
+        session_id: str,
+        owner_token: str | None,
+    ) -> None:
+        """Enforce the database-wide lease whenever one is active.
+
+        Ordinary repository use without a lease remains compatible. Once a
+        lease row exists, however, grouped writes must name its exact session
+        and owner token. Age alone never invalidates or transfers ownership.
+        """
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT session_id, owner_token FROM recording_leases WHERE lease_key=1"
+        ).fetchone()
+        if row is None:
+            if owner_token is not None:
+                raise RecordingLeaseOwnershipError("recording lease is no longer active")
+            return
+        if row["session_id"] != session_id or row["owner_token"] != owner_token:
+            raise RecordingLeaseOwnershipError("grouped write is not owned by the active recording lease")
+
+    @staticmethod
     def _upsert_camera(
         connection: sqlite3.Connection,
         camera: CameraIdentity,
@@ -675,12 +699,14 @@ class GroupedExperimentRepository:
         observed_at: str,
         elapsed_ns: int | None = None,
         reason_code: str | None = None,
+        owner_token: str | None = None,
     ) -> None:
         target = StreamStatus(_enum_value(status))
         _validate_nonnegative_sqlite_int("elapsed_ns", elapsed_ns)
         self._validate_reason(reason_code)
         with self.database.connect() as connection:
             self._require_v3(connection)
+            self._require_lease_owner(connection, session_id, owner_token)
             current = connection.execute(
                 """SELECT bs.stream_status, bs.benchmark_id, bs.data_complete,
                           g.status AS group_status
@@ -731,7 +757,8 @@ class GroupedExperimentRepository:
                 ).fetchone()[0]
                 if sibling_active:
                     self._set_group_status_in_transaction(
-                        connection, session_id, GroupStatus.DEGRADED, observed_at
+                        connection, session_id, GroupStatus.DEGRADED, observed_at,
+                        owner_token=owner_token,
                     )
 
     def set_group_status(
@@ -742,6 +769,7 @@ class GroupedExperimentRepository:
         observed_at: str,
         elapsed_ns: int | None = None,
         reason_code: str | None = None,
+        owner_token: str | None = None,
     ) -> None:
         target = GroupStatus(_enum_value(status))
         if target in {
@@ -754,7 +782,8 @@ class GroupedExperimentRepository:
         with self.database.connect() as connection:
             self._require_v3(connection)
             self._set_group_status_in_transaction(
-                connection, session_id, target, observed_at, elapsed_ns, reason_code
+                connection, session_id, target, observed_at, elapsed_ns, reason_code,
+                owner_token=owner_token,
             )
 
     def _set_group_status_in_transaction(
@@ -765,7 +794,9 @@ class GroupedExperimentRepository:
         observed_at: str,
         elapsed_ns: int | None = None,
         reason_code: str | None = None,
+        owner_token: str | None = None,
     ) -> None:
+        self._require_lease_owner(connection, session_id, owner_token)
         row = connection.execute(
             "SELECT status FROM group_recordings WHERE session_id=?", (session_id,)
         ).fetchone()
@@ -825,6 +856,7 @@ class GroupedExperimentRepository:
         *,
         observed_at: str,
         elapsed_ns: int | None = None,
+        owner_token: str | None = None,
     ) -> None:
         if not increments:
             return
@@ -844,6 +876,7 @@ class GroupedExperimentRepository:
         parameters.extend((queue_loss, persistence_loss, session_id, slot))
         with self.database.connect() as connection:
             self._require_v3(connection)
+            self._require_lease_owner(connection, session_id, owner_token)
             cursor = connection.execute(
                 f"""UPDATE benchmark_streams SET {', '.join(assignments)}
                     WHERE session_id=? AND slot=?""",
@@ -891,11 +924,13 @@ class GroupedExperimentRepository:
         observed_at: str,
         elapsed_ns: int | None = None,
         details: Mapping[str, Any] | None = None,
+        owner_token: str | None = None,
     ) -> None:
         self._validate_reason(reason_code)
         _validate_nonnegative_sqlite_int("elapsed_ns", elapsed_ns)
         with self.database.connect() as connection:
             self._require_v3(connection)
+            self._require_lease_owner(connection, session_id, owner_token)
             row = connection.execute(
                 """SELECT bs.benchmark_id, bs.integrity_flags_json, g.status
                    FROM benchmark_streams bs JOIN group_recordings g ON g.session_id=bs.session_id
@@ -936,6 +971,8 @@ class GroupedExperimentRepository:
         session_id: str,
         slot: str,
         samples: Sequence[MeasurementSample],
+        *,
+        owner_token: str | None = None,
     ) -> int:
         if not samples:
             return 0
@@ -943,6 +980,7 @@ class GroupedExperimentRepository:
             raise ValueError(f"group measurement batch exceeds {MAX_GROUP_MEASUREMENT_BATCH} samples")
         with self.database.connect() as connection:
             self._require_v3(connection)
+            self._require_lease_owner(connection, session_id, owner_token)
             stream = connection.execute(
                 """SELECT benchmark_id, stream_status, last_persisted_sample_index,
                           last_persisted_elapsed_ns, integrity_flags_json
@@ -1047,6 +1085,7 @@ class GroupedExperimentRepository:
         *,
         first_elapsed_ns: int,
         last_elapsed_ns: int,
+        owner_token: str | None = None,
     ) -> None:
         """Persist host-observed bounds independently from durable sample rows.
 
@@ -1060,6 +1099,7 @@ class GroupedExperimentRepository:
             raise ValueError("host arrival bounds must be ordered nonnegative integers")
         with self.database.connect() as connection:
             self._require_v3(connection)
+            self._require_lease_owner(connection, session_id, owner_token)
             row = connection.execute(
                 """SELECT first_host_arrival_elapsed_ns, last_host_arrival_elapsed_ns
                    FROM benchmark_streams WHERE session_id=? AND slot=?""",
@@ -1086,6 +1126,7 @@ class GroupedExperimentRepository:
         ended_at: str,
         duration_by_slot: Mapping[str, float],
         termination_reason: str,
+        owner_token: str | None = None,
     ) -> GroupedExperimentRecord:
         target = GroupStatus(_enum_value(status))
         if target not in {
@@ -1105,6 +1146,7 @@ class GroupedExperimentRepository:
         self._validate_reason(termination_reason)
         with self.database.connect() as connection:
             self._require_v3(connection)
+            self._require_lease_owner(connection, session_id, owner_token)
             parent = connection.execute(
                 """SELECT status, data_complete, integrity_flags_json
                    FROM group_recordings WHERE session_id=?""",
@@ -1200,6 +1242,7 @@ class GroupedExperimentRepository:
             self._set_group_status_in_transaction(
                 connection, session_id, target, ended_at,
                 reason_code=termination_reason,
+                owner_token=owner_token,
             )
             connection.execute(
                 """UPDATE group_recordings SET finalized_at=?
@@ -1209,6 +1252,13 @@ class GroupedExperimentRepository:
             connection.execute(
                 "UPDATE sessions SET ended_at=? WHERE id=?", (ended_at, session_id)
             )
+            if owner_token is not None:
+                cursor = connection.execute(
+                    "DELETE FROM recording_leases WHERE lease_key=1 AND session_id=? AND owner_token=?",
+                    (session_id, owner_token),
+                )
+                if cursor.rowcount != 1:
+                    raise RecordingLeaseOwnershipError("cannot finalize after losing the recording lease")
         result = self.get_group(session_id)
         if result is None:
             raise GroupInvariantError("finalized group could not be read back")
@@ -1229,6 +1279,7 @@ class GroupedExperimentRepository:
         token = owner_token or str(uuid4())
         with self.database.connect() as connection:
             self._require_v3(connection)
+            connection.execute("BEGIN IMMEDIATE")
             group = connection.execute(
                 "SELECT status FROM group_recordings WHERE session_id=?", (session_id,)
             ).fetchone()
@@ -1309,9 +1360,11 @@ class GroupedExperimentRepository:
         benchmark_id: str | None = None,
         reason_code: str | None = None,
         details: Mapping[str, Any] | None = None,
+        owner_token: str | None = None,
     ) -> int:
         with self.database.connect() as connection:
             self._require_v3(connection)
+            self._require_lease_owner(connection, session_id, owner_token)
             self._insert_event(
                 connection, session_id, benchmark_id, event_type, elapsed_ns,
                 observed_at, reason_code, details or {},

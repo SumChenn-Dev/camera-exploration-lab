@@ -372,6 +372,24 @@ class ExperimentAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(normalized[1][1], 10.0)
         self.assertAlmostEqual(normalized[2][1], -10.0)
         self.assertEqual(rate_deviation_percent(points, None), ())
+        self.assertEqual(rate_deviation_percent(points, 0.0), ())
+
+        high_rate = rate_deviation_percent(
+            ((0.5, 187.35), (15.0, 187.50), (29.5, 187.20)), 187.35
+        )
+        self.assertAlmostEqual(high_rate[0][1], 0.0)
+        self.assertAlmostEqual(high_rate[1][1], 100.0 * (187.50 - 187.35) / 187.35)
+        self.assertAlmostEqual(high_rate[2][1], 100.0 * (187.20 - 187.35) / 187.35)
+        valid = rate_deviation_percent(
+            ((0.0, 60.0), (1.0, 60.6), (2.0, 59.4), (3.0, float("nan")), (float("inf"), 60.0)),
+            60.0,
+        )
+        self.assertEqual(len(valid), 3)
+        self.assertAlmostEqual(valid[0][1], 0.0)
+        self.assertAlmostEqual(valid[1][1], 1.0)
+        self.assertAlmostEqual(valid[2][1], -1.0)
+        extreme = rate_deviation_percent(((1.0, 300.0),), 187.35)
+        self.assertAlmostEqual(extreme[0][1], 100.0 * (300.0 - 187.35) / 187.35)
 
     def test_large_series_is_bounded_and_preserves_global_outliers(self) -> None:
         session = SessionRecord(

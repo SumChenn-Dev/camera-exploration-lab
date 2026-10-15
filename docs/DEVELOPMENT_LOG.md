@@ -71,3 +71,11 @@ This log records completed engineering milestones and the public repository setu
 ## Known follow-up work
 
 Manual interruption, physical disconnect/reconnect, and restart persistence need additional hands-on verification. Exports, broad camera controls, and the CHDKPTP backend remain future work. CEL-013 multi-camera experiment recording is the high-priority upcoming milestone. See the [Exploration Notebook](EXPLORATION_NOTEBOOK.md) for the maintained roadmap.
+
+## Phase 2B — Graph correctness and navigation follow-up
+
+- PyQtGraph 0.14.0 inspection reproduced two redraw defects: `PlotItem.clear()` removes curves but preserves a user-set `ViewBox` range, leaving normalized near-zero curves outside the old absolute-FPS range; it also leaves a detached legend reference that `addLegend()` can reuse after redraw.
+- Kept the per-session deviation calculation explicit as 100 × (window FPS − session mean FPS) / session mean FPS and filtered non-finite samples. Redraws now recreate legends and reset axes from visible valid data; recorder elapsed axes reset to the measured duration.
+- Added labeled Fit to Data, Reset View, Zoom In/Out, drag-to-pan, and Expand Plot/Restore Layout controls. The two main plots stack below 1120 px and remain inside a vertically scrolling workspace without horizontal page scrolling.
+- Extended palette-aware contrast to metadata, completion notes, disabled comparison controls, graph labels, and legends. No schema, recording, camera, or database behavior changed.
+- Verification: 90 camera-free tests pass; Python sources parse, dependency integrity and Git checks pass, and the release-ready privacy audit passes. A source-only wheel builds with system Python; the application virtual environment lacks setuptools for an in-environment wheel build. Physical GUI review remains a manual acceptance step.

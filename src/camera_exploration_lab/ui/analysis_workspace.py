@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 import pyqtgraph as pg
@@ -41,6 +42,7 @@ from ..analysis import (
 )
 from ..db import Database
 from .metrics_guide import MetricsGuideDialog
+from .plot_navigation import PlotNavigationControls, reset_plot_view, visible_plot_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,50 @@ def contrast_ratio(foreground: QColor, background: QColor) -> float:
     return (first + 0.05) / (second + 0.05)
 
 
+def palette_text_color(background: QColor, palette: QPalette) -> QColor:
+    """Choose a palette-aware text color with the strongest available contrast."""
+    candidates = (
+        palette.color(QPalette.ColorRole.Text),
+        palette.color(QPalette.ColorRole.WindowText),
+        QColor("#ffffff"),
+        QColor("#000000"),
+    )
+    return max(candidates, key=lambda color: contrast_ratio(color, background))
+
+
+def palette_disabled_text_color(background: QColor, palette: QPalette) -> QColor:
+    """Keep disabled explanations readable while making them visually quieter."""
+    foreground = palette_text_color(background, palette)
+    for amount in (0.34, 0.28, 0.22, 0.16, 0.10):
+        candidate = QColor(
+            round(foreground.red() * (1 - amount) + background.red() * amount),
+            round(foreground.green() * (1 - amount) + background.green() * amount),
+            round(foreground.blue() * (1 - amount) + background.blue() * amount),
+        )
+        if contrast_ratio(candidate, background) >= 4.5:
+            return candidate
+    return foreground
+
+
+def _finite_points(points: tuple[tuple[float, float], ...]) -> tuple[tuple[float, float], ...]:
+    result = []
+    for point in points:
+        try:
+            x, y = float(point[0]), float(point[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if math.isfinite(x) and math.isfinite(y):
+            result.append((x, y))
+    return tuple(result)
+
+
+def _clear_plot(plot: pg.PlotWidget) -> None:
+    """Clear curves, discard PyQtGraph's detached legend reference, and re-enable auto-range."""
+    plot.clear()
+    plot.plotItem.legend = None
+    plot.plotItem.vb.enableAutoRange(x=True, y=True)
+
+
 class _RateAxisItem(pg.AxisItem):
     """Format normalized FPS deviations as readable percentages."""
 
@@ -71,8 +117,10 @@ class _RateAxisItem(pg.AxisItem):
         labels = []
         for value in values:
             absolute = abs(float(value))
-            if absolute < 0.01:
+            if absolute < 0.00005:
                 rendered = "0"
+            elif absolute < 0.01:
+                rendered = f"{value:.4f}".rstrip("0").rstrip(".")
             elif absolute < 1:
                 rendered = f"{value:.2f}"
             elif absolute < 100:
@@ -211,6 +259,9 @@ class AnalysisWorkspace(QWidget):
         self._updating_selectors = False
         self._shutting_down = False
         self._metrics_dialog: MetricsGuideDialog | None = None
+        self._plot_splitter: QSplitter | None = None
+        self._plot_splitter_sizes: list[int] | None = None
+        self._expanded_plot_key: str | None = None
         self._build_ui()
         self.refresh_experiments()
 
@@ -219,6 +270,7 @@ class AnalysisWorkspace(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         page = QWidget()
         page_layout = QVBoxLayout(page)
@@ -276,17 +328,19 @@ class AnalysisWorkspace(QWidget):
 
         self.status_label = QLabel("Loading saved experiments…")
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: palette(mid);")
+        self.status_label.setProperty("celThemeText", True)
         page_layout.addWidget(self.status_label)
         self.empty_state = QLabel()
         self.empty_state.setWordWrap(True)
         self.empty_state.setStyleSheet("padding: 8px; border: 1px solid palette(mid); border-radius: 4px;")
+        self.empty_state.setProperty("celThemeText", True)
         self.empty_state.hide()
         page_layout.addWidget(self.empty_state)
 
         self.experiment_heading = QLabel("Select a saved experiment")
         self.experiment_heading.setTextFormat(Qt.TextFormat.PlainText)
         self.experiment_heading.setStyleSheet("font-size: 16px; font-weight: 600;")
+        self.experiment_heading.setProperty("celThemeText", True)
         page_layout.addWidget(self.experiment_heading)
         header = QHBoxLayout()
         self.header_values: dict[str, QLabel] = {}
@@ -298,11 +352,13 @@ class AnalysisWorkspace(QWidget):
             chip_layout.setContentsMargins(8, 5, 8, 5)
             chip_layout.setSpacing(2)
             caption = QLabel(title)
-            caption.setStyleSheet("font-size: 10px; color: palette(mid);")
+            caption.setStyleSheet("font-size: 10px;")
+            caption.setProperty("celThemeText", True)
             value = QLabel("—")
             value.setWordWrap(True)
             value.setMaximumHeight(38)
             value.setToolTip(title)
+            value.setProperty("celThemeText", True)
             chip_layout.addWidget(caption)
             chip_layout.addWidget(value)
             header.addWidget(chip, 1)
@@ -331,7 +387,7 @@ class AnalysisWorkspace(QWidget):
 
         self.warning_label = QLabel()
         self.warning_label.setWordWrap(True)
-        self.warning_label.setStyleSheet("color: #8b5e00;")
+        self.warning_label.setProperty("celThemeText", True)
         self.warning_label.hide()
         page_layout.addWidget(self.warning_label)
         self.details_toggle = QToolButton()
@@ -345,6 +401,7 @@ class AnalysisWorkspace(QWidget):
         self.details_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.details_text.setFrameShape(QFrame.Shape.StyledPanel)
         self.details_text.setContentsMargins(8, 6, 8, 6)
+        self.details_text.setProperty("celThemeText", True)
         self.details_text.hide()
         self.metadata_label = self.details_text
         page_layout.addWidget(self.details_toggle)
@@ -353,13 +410,21 @@ class AnalysisWorkspace(QWidget):
         chart_options = QHBoxLayout()
         self.fps_deviation_checkbox = QCheckBox("Show deviation from each run's mean (%)")
         self.fps_deviation_checkbox.setToolTip(
-            "Each recorded FPS window is shown as a percentage of that session's measured mean. No interpolation is performed."
+            "Each recorded FPS window is shown as 100 × (window rate − that session's mean) / that session's mean. Zero is the session mean; no interpolation is performed."
         )
         self.interval_overlay_checkbox = QCheckBox("Overlay compatible interval timelines")
         self.interval_overlay_checkbox.setToolTip(
             "Requires recorder elapsed timestamps, matching stream scope, and matching timing method."
         )
         chart_options.addWidget(self.fps_deviation_checkbox)
+        self.fps_primary_checkbox = QCheckBox("Show Session A rate")
+        self.fps_primary_checkbox.setChecked(True)
+        self.fps_primary_checkbox.setToolTip("Show or hide Session A's recorded capture-rate curve.")
+        self.fps_comparison_checkbox = QCheckBox("Show Session B rate")
+        self.fps_comparison_checkbox.setChecked(True)
+        self.fps_comparison_checkbox.setToolTip("Show or hide Session B's recorded capture-rate curve.")
+        chart_options.addWidget(self.fps_primary_checkbox)
+        chart_options.addWidget(self.fps_comparison_checkbox)
         self.interval_primary_checkbox = QCheckBox("Show Session A intervals")
         self.interval_primary_checkbox.setChecked(True)
         self.interval_primary_checkbox.setToolTip("Show or hide the primary interval trace without changing its stored measurements.")
@@ -369,6 +434,8 @@ class AnalysisWorkspace(QWidget):
         page_layout.addLayout(chart_options)
 
         plots = QSplitter(Qt.Orientation.Horizontal)
+        plots.setChildrenCollapsible(True)
+        self._plot_splitter = plots
         self.fps_plot = self._make_plot(
             "Capture FPS vs elapsed time", "Capture FPS (frames/s)", "Recorder elapsed time (s)",
             "Windowed observed capture rate. Samples retain each run's recorded times; curves are not synchronized.",
@@ -380,8 +447,18 @@ class AnalysisWorkspace(QWidget):
         )
         self.fps_note = QLabel("Select an experiment with recorded capture timing.")
         self.interval_note = QLabel("Select an experiment with recorded frame intervals.")
-        plots.addWidget(self._plot_panel("Capture rate", self.fps_plot, self.fps_note))
-        plots.addWidget(self._plot_panel("Frame intervals", self.interval_plot, self.interval_note))
+        for label in (self.fps_note, self.interval_note):
+            label.setProperty("celThemeText", True)
+        self.fps_controls = PlotNavigationControls("fps", self.fps_plot)
+        self.interval_controls = PlotNavigationControls("interval", self.interval_plot)
+        self.fps_controls.reset_requested.connect(self._reset_plot)
+        self.interval_controls.reset_requested.connect(self._reset_plot)
+        self.fps_controls.expand_requested.connect(self._toggle_plot_focus)
+        self.interval_controls.expand_requested.connect(self._toggle_plot_focus)
+        self._fps_panel = self._plot_panel("Capture rate", self.fps_plot, self.fps_note, self.fps_controls)
+        self._interval_panel = self._plot_panel("Frame intervals", self.interval_plot, self.interval_note, self.interval_controls)
+        plots.addWidget(self._fps_panel)
+        plots.addWidget(self._interval_panel)
         plots.setStretchFactor(0, 3)
         plots.setStretchFactor(1, 2)
         plots.setMinimumHeight(270)
@@ -391,6 +468,7 @@ class AnalysisWorkspace(QWidget):
         comparison_layout = QVBoxLayout(comparison_group)
         self.comparison_notice = QLabel("Choose Session B to compare two saved recordings.")
         self.comparison_notice.setWordWrap(True)
+        self.comparison_notice.setProperty("celThemeText", True)
         self.comparison_notice.setToolTip(
             "Requested FPS, delivered capture FPS, preview FPS, and processing FPS have separate meanings."
         )
@@ -411,6 +489,7 @@ class AnalysisWorkspace(QWidget):
         )
         self.distribution_note = QLabel("Choose Session B to compare interval distributions.")
         self.distribution_note.setWordWrap(True)
+        self.distribution_note.setProperty("celThemeText", True)
         lower.addWidget(comparison_group)
         lower.addWidget(self._plot_panel("Interval distribution", self.distribution_plot, self.distribution_note))
         lower.setStretchFactor(0, 3)
@@ -435,20 +514,33 @@ class AnalysisWorkspace(QWidget):
         self.swap_button.clicked.connect(self._swap_sessions)
         self.clear_comparison_button.clicked.connect(self._clear_comparison)
         self.details_toggle.toggled.connect(self._toggle_details)
-        self.fps_deviation_checkbox.toggled.connect(self._redraw_comparison_curves)
-        self.interval_primary_checkbox.toggled.connect(self._redraw_comparison_curves)
-        self.interval_overlay_checkbox.toggled.connect(self._redraw_comparison_curves)
+        self.fps_deviation_checkbox.toggled.connect(self._redraw_fps_curves)
+        self.fps_primary_checkbox.toggled.connect(self._redraw_fps_curves)
+        self.fps_comparison_checkbox.toggled.connect(self._redraw_fps_curves)
+        self.interval_primary_checkbox.toggled.connect(self._redraw_interval_curves)
+        self.interval_overlay_checkbox.toggled.connect(self._redraw_interval_curves)
+        self._update_theme_contrast()
 
     @staticmethod
-    def _plot_panel(title: str, plot: pg.PlotWidget, note: QLabel) -> QWidget:
+    def _plot_panel(
+        title: str,
+        plot: pg.PlotWidget,
+        note: QLabel,
+        controls: PlotNavigationControls | None = None,
+    ) -> QWidget:
         panel = QWidget()
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(4, 3, 4, 3)
         heading = QLabel(title)
         heading.setStyleSheet("font-size: 13px; font-weight: 600;")
+        heading.setProperty("celThemeText", True)
         panel_layout.addWidget(heading)
+        if controls is not None:
+            panel_layout.addWidget(controls)
         panel_layout.addWidget(plot, 1)
-        note.setStyleSheet("font-size: 11px; color: palette(mid);")
+        note.setStyleSheet("font-size: 11px;")
+        note.setWordWrap(True)
+        note.setProperty("celThemeText", True)
         panel_layout.addWidget(note)
         return panel
 
@@ -489,7 +581,6 @@ class AnalysisWorkspace(QWidget):
     def refresh_experiments(self) -> None:
         if self._shutting_down:
             return
-        self.status_label.setStyleSheet("color: palette(mid);")
         self.status_label.setText("Reading saved experiment index…")
         self._submit("list")
 
@@ -551,7 +642,6 @@ class AnalysisWorkspace(QWidget):
     def _task_failed(self, request_id: int, message: str) -> None:
         if not self._shutting_down and request_id == self._request_id:
             self.status_label.setText(f"Analysis could not be loaded: {message}")
-            self.status_label.setStyleSheet("color: #a33;")
 
     def _populate_filter_choices(self) -> None:
         camera_value = self.camera_filter.currentData()
@@ -713,7 +803,6 @@ class AnalysisWorkspace(QWidget):
         if not primary:
             self._clear_analysis()
             return
-        self.status_label.setStyleSheet("color: palette(mid);")
         self.status_label.setText("Loading stored timings in the background…")
         self._submit(
             "analysis",
@@ -726,7 +815,6 @@ class AnalysisWorkspace(QWidget):
     ) -> None:
         self._primary = primary
         self._comparison = comparison
-        self.status_label.setStyleSheet("color: palette(mid);")
         self.status_label.setText(
             f"{primary.saved_status.capitalize()} · {primary.interval_stats.count:,} analyzed interval sample(s)"
             if primary.interval_data_available else f"{primary.saved_status.capitalize()} · raw interval series unavailable"
@@ -739,91 +827,190 @@ class AnalysisWorkspace(QWidget):
         if not can_overlay:
             self.interval_overlay_checkbox.setChecked(False)
         can_compare_fps = self._can_compare_fps(primary, comparison)
-        self.fps_deviation_checkbox.setEnabled(can_compare_fps)
-        if not can_compare_fps:
+        self.fps_primary_checkbox.setEnabled(bool(_finite_points(primary.fps_points)))
+        self.fps_comparison_checkbox.setEnabled(can_compare_fps)
+        can_deviate = self._can_deviate(primary) or (
+            can_compare_fps and self._can_deviate(comparison)
+        )
+        self.fps_deviation_checkbox.setEnabled(can_deviate)
+        if not can_deviate and self.fps_deviation_checkbox.isChecked():
             self.fps_deviation_checkbox.setChecked(False)
         self._draw_interval_plot(primary)
         self._draw_fps_plot(primary, comparison)
         self._draw_comparison(primary, comparison)
+        self._update_theme_contrast()
 
     def _draw_interval_plot(self, analysis: ExperimentAnalysis) -> None:
-        self.interval_plot.clear()
+        _clear_plot(self.interval_plot)
         plot = self.interval_plot.plotItem
         plot.setLabel("bottom", analysis.interval_x_label)
-        series = []
+        series: list[tuple[ExperimentAnalysis, str, str]] = []
         if self.interval_primary_checkbox.isChecked():
             series.append((analysis, "#167d9a", "A"))
-        if (self.interval_overlay_checkbox.isEnabled() and self.interval_overlay_checkbox.isChecked()
-                and self._comparison):
+        if (
+            self.interval_overlay_checkbox.isEnabled()
+            and self.interval_overlay_checkbox.isChecked()
+            and self._comparison is not None
+        ):
             series.append((self._comparison, "#b66518", "B"))
-        if any(item.interval_points for item, _color, _side in series):
+
+        plotted: list[tuple[ExperimentAnalysis, tuple[tuple[float, float], ...]]] = []
+        if any(_finite_points(item.interval_points) for item, _color, _side in series):
             plot.addLegend(offset=(10, 8))
         for item, color, side in series:
-            if not item.interval_points:
+            points = _finite_points(item.interval_points)
+            if not points:
                 continue
-            x_values, y_values = zip(*item.interval_points)
-            line = plot.plot(
-                x_values, y_values,
-                pen=pg.mkPen(color, width=1.25 if len(x_values) > 500 else 1.7,
-                             style=Qt.PenStyle.SolidLine if side == "A" else Qt.PenStyle.DashLine),
+            x_values, y_values = zip(*points)
+            curve = plot.plot(
+                x_values,
+                y_values,
+                pen=pg.mkPen(
+                    color,
+                    width=1.25 if len(x_values) > 500 else 1.7,
+                    style=Qt.PenStyle.SolidLine if side == "A" else Qt.PenStyle.DashLine,
+                ),
                 symbol=("o" if side == "A" else "t") if len(x_values) < 140 else None,
                 symbolSize=5,
                 name=f"Session {side} · {self._short_session(item)}",
             )
-            line.setToolTip(self._full_session_label(item))
+            curve.setToolTip(self._full_session_label(item))
+            plotted.append((item, points))
+
+        self.interval_controls.set_data_available(bool(plotted))
+        if not plotted:
+            self.interval_note.setText(
+                "No valid interval trace is available for the enabled session(s)."
+                if series
+                else "No interval trace is enabled. Select Session A or a compatible Session B overlay."
+            )
+            return
         if analysis.interval_data_available:
             self.interval_note.setText(
-                "Recorder timestamps are host frame-arrival times; intervals are not sensor-to-display latency."
+                "Host frame-arrival intervals; they do not measure sensor exposure or display latency."
             )
         elif analysis.interval_boundary_samples_excluded:
             self.interval_note.setText(
-                "The first CSV 0.000 ms row is retained as source data and excluded from interval statistics because it has no preceding frame."
+                "The first CSV 0.000 ms row is preserved as source data and excluded from statistics because it has no preceding frame."
             )
         elif analysis.interval_stats.from_saved_summary:
-            self.interval_note.setText("A saved summary is available; the raw interval timeline was not stored.")
+            self.interval_note.setText("A saved summary is available; no raw interval timeline was stored.")
         else:
-            self.interval_note.setText("No raw frame-interval timeline is available for this recording.")
+            self.interval_note.setText("Recorded intervals are shown as stored; sparse traces are not interpolated.")
+        x_range = self._elapsed_x_range(
+            [item for item, _points in plotted], self.interval_plot, analysis.interval_x_label
+        )
+        reset_plot_view(self.interval_plot, x_range)
 
     def _draw_fps_plot(
         self, analysis: ExperimentAnalysis, comparison: ExperimentAnalysis | None
     ) -> None:
-        self.fps_plot.clear()
+        _clear_plot(self.fps_plot)
         plot = self.fps_plot.plotItem
+        deviation_mode = self.fps_deviation_checkbox.isChecked()
         plot.setTitle("Capture FPS comparison" if comparison else "Capture FPS over time")
         plot.setLabel("bottom", analysis.fps_x_label)
-        percent_axis = self.fps_plot.plotItem.getAxis("left")
-        if isinstance(percent_axis, _RateAxisItem):
-            percent_axis.percent_mode = self.fps_deviation_checkbox.isChecked()
-            percent_axis.picture = None
-            percent_axis.update()
-        plot.setLabel("left", "Deviation from run mean (%)" if self.fps_deviation_checkbox.isChecked() else "Capture FPS (frames/s)")
-        series = [(analysis, "#167d9a", "A")]
-        if comparison is not None and self._can_compare_fps(analysis, comparison):
+        axis = plot.getAxis("left")
+        if isinstance(axis, _RateAxisItem):
+            axis.percent_mode = deviation_mode
+            axis.picture = None
+            axis.update()
+        plot.setLabel(
+            "left",
+            "Deviation from session mean (%)" if deviation_mode else "Capture FPS (frames/s)",
+        )
+
+        series: list[tuple[ExperimentAnalysis, str, str]] = []
+        if self.fps_primary_checkbox.isChecked():
+            series.append((analysis, "#167d9a", "A"))
+        if (
+            comparison is not None
+            and self.fps_comparison_checkbox.isChecked()
+            and self._can_compare_fps(analysis, comparison)
+        ):
             series.append((comparison, "#b66518", "B"))
-            plot.setLabel("bottom", "Recorder elapsed time (s)")
-        if any(item.fps_points for item, _color, _side in series):
+        plotted: list[tuple[ExperimentAnalysis, tuple[tuple[float, float], ...]]] = []
+        skipped: list[str] = []
+        if any(
+            _finite_points(item.fps_points)
+            and (not deviation_mode or self._can_deviate(item))
+            for item, _color, _side in series
+        ):
             plot.addLegend(offset=(10, 8))
         for item, color, side in series:
-            points = item.fps_points
-            if self.fps_deviation_checkbox.isChecked():
+            points = _finite_points(item.fps_points)
+            if deviation_mode:
                 points = rate_deviation_percent(points, item.capture_fps_stats.mean)
+                if not points:
+                    skipped.append(f"Session {side} has no finite positive capture-FPS mean.")
             if not points:
                 continue
             x_values, y_values = zip(*points)
-            line = plot.plot(
-                x_values, y_values,
-                pen=pg.mkPen(color, width=1.7, style=Qt.PenStyle.SolidLine if side == "A" else Qt.PenStyle.DashLine),
+            curve = plot.plot(
+                x_values,
+                y_values,
+                pen=pg.mkPen(
+                    color,
+                    width=1.7,
+                    style=Qt.PenStyle.SolidLine if side == "A" else Qt.PenStyle.DashLine,
+                ),
                 symbol=("o" if side == "A" else "t") if len(x_values) < 120 else None,
                 symbolSize=5,
                 name=f"Session {side} · {self._short_session(item)}",
             )
-            line.setToolTip(f"{self._full_session_label(item)}\n{item.fps_method}")
+            curve.setToolTip(f"{self._full_session_label(item)}\n{item.fps_method}")
+            plotted.append((item, points))
+
+        self.fps_controls.set_data_available(bool(plotted))
+        if not plotted:
+            if not series:
+                self.fps_note.setText("No capture-rate trace is enabled. Select Session A or Session B.")
+            elif skipped:
+                self.fps_note.setText(" ".join(skipped))
+            else:
+                self.fps_note.setText("No valid capture-FPS time series is available for the enabled session(s).")
+            return
+
         self.fps_note.setText(
-            "Windowed capture rate from stored intervals. Each run keeps its own elapsed-time samples; no interpolation or simultaneity is implied."
-            if comparison and self._can_compare_fps(analysis, comparison)
-            else analysis.fps_method if not analysis.fps_points else "Capture rate is separate from GUI preview and processing rates."
+            "Separate recordings are aligned to their own elapsed clocks; no interpolation or simultaneous capture is implied."
+            if len(plotted) > 1
+            else "Observed host capture throughput; separate from GUI preview and processing rates."
         )
+        if skipped:
+            self.fps_note.setText(self.fps_note.text() + " " + " ".join(skipped))
+        x_range = self._elapsed_x_range(
+            [item for item, _points in plotted], self.fps_plot, analysis.fps_x_label
+        )
+        reset_plot_view(self.fps_plot, x_range)
         self.fps_plot.setToolTip(analysis.fps_method)
+
+    @staticmethod
+    def _can_deviate(analysis: ExperimentAnalysis | None) -> bool:
+        return bool(
+            analysis is not None
+            and _finite_points(analysis.fps_points)
+            and analysis.capture_fps_stats.mean is not None
+            and math.isfinite(analysis.capture_fps_stats.mean)
+            and analysis.capture_fps_stats.mean > 0
+        )
+
+    @staticmethod
+    def _elapsed_x_range(
+        analyses: list[ExperimentAnalysis],
+        plot: pg.PlotWidget,
+        x_label: str,
+    ) -> tuple[float, float] | None:
+        if x_label != "Recorder elapsed time (s)":
+            return None
+        bounds = visible_plot_bounds(plot)
+        data_end = bounds[1] if bounds is not None else 0.0
+        durations = [
+            item.duration_seconds
+            for item in analyses
+            if item.duration_seconds is not None and math.isfinite(item.duration_seconds)
+        ]
+        end = max([data_end, *durations], default=0.0)
+        return (0.0, end if end > 0 else 1.0)
 
     def _draw_comparison(
         self, primary: ExperimentAnalysis, comparison: ExperimentAnalysis | None
@@ -842,9 +1029,6 @@ class AnalysisWorkspace(QWidget):
         if any(a.interval_histogram.underflow_count or a.interval_histogram.overflow_count for a in (primary, comparison)):
             notice_lines.append("Distribution edge bins include out-of-range intervals; summary statistics use actual values.")
         self.comparison_notice.setText("\n".join(dict.fromkeys(notice_lines)))
-        self.comparison_notice.setStyleSheet(
-            "color: #9b5c00;" if any(notice.is_warning for notice in notices) else "color: #26734d;"
-        )
         rows = self._comparison_rows(primary, comparison)
         self.comparison_table.setRowCount(len(rows))
         for row_index, values in enumerate(rows):
@@ -897,7 +1081,7 @@ class AnalysisWorkspace(QWidget):
     def _draw_histograms(
         self, left: ExperimentAnalysis, right: ExperimentAnalysis | None
     ) -> None:
-        self.distribution_plot.clear()
+        _clear_plot(self.distribution_plot)
         plot = self.distribution_plot.plotItem
         plot.setTitle("Interval distribution")
         self.distribution_plot.setLogMode(x=True, y=False)
@@ -972,7 +1156,7 @@ class AnalysisWorkspace(QWidget):
             warnings.append("Raw interval data is unavailable; no timing series is fabricated from summary fields.")
         if analysis.option.source == "imported":
             warnings.append("Imported runs may have different timestamp scope or summary precision.")
-        self.warning_label.setText("  ·  ".join(warnings))
+        self.warning_label.setText("⚠  " + "  ·  ".join(warnings))
         self.warning_label.setVisible(bool(warnings))
 
     def _render_detail_text(self, analysis: ExperimentAnalysis) -> None:
@@ -1062,10 +1246,133 @@ class AnalysisWorkspace(QWidget):
         label = f"{analysis.option.camera} · {analysis.option.label}"
         return label if len(label) <= 38 else label[:35] + "…"
 
-    def _redraw_comparison_curves(self, _checked: bool = False) -> None:
+    def _reset_plot(self, key: str) -> None:
+        if key == "fps":
+            analyses = []
+            if self._primary and self.fps_primary_checkbox.isChecked():
+                analyses.append(self._primary)
+            if (
+                self._comparison
+                and self.fps_comparison_checkbox.isChecked()
+                and self._primary
+                and self._can_compare_fps(self._primary, self._comparison)
+            ):
+                analyses.append(self._comparison)
+            reset_plot_view(
+                self.fps_plot,
+                self._elapsed_x_range(analyses, self.fps_plot, self.fps_plot.plotItem.getAxis("bottom").labelText),
+            )
+        elif key == "interval":
+            analyses = []
+            if self._primary and self.interval_primary_checkbox.isChecked():
+                analyses.append(self._primary)
+            if (
+                self._comparison
+                and self.interval_overlay_checkbox.isChecked()
+                and self._can_overlay_intervals(self._primary, self._comparison)
+            ):
+                analyses.append(self._comparison)
+            reset_plot_view(
+                self.interval_plot,
+                self._elapsed_x_range(analyses, self.interval_plot, self.interval_plot.plotItem.getAxis("bottom").labelText),
+            )
+
+    def _toggle_plot_focus(self, key: str, expanded: bool) -> None:
+        if self._plot_splitter is None:
+            return
+        controls = {"fps": self.fps_controls, "interval": self.interval_controls}
+        if expanded:
+            if self._expanded_plot_key is None:
+                self._plot_splitter_sizes = self._plot_splitter.sizes()
+            other = "interval" if key == "fps" else "fps"
+            controls[other].set_expanded(False)
+            self._expanded_plot_key = key
+            self._plot_splitter.setSizes([1, 0] if key == "fps" else [0, 1])
+            return
+        if self._expanded_plot_key == key:
+            self._expanded_plot_key = None
+            self._plot_splitter.setSizes(self._plot_splitter_sizes or [3, 2])
+            self._plot_splitter_sizes = None
+
+    def _update_theme_contrast(self) -> None:
+        surface = self.palette().color(QPalette.ColorRole.Window)
+        foreground = palette_text_color(surface, self.palette())
+        disabled = palette_disabled_text_color(surface, self.palette())
+        for label in self.findChildren(QLabel):
+            if not label.property("celThemeText"):
+                continue
+            saved_style = label.property("celThemeBaseStyle")
+            if saved_style is None:
+                saved_style = label.styleSheet()
+                label.setProperty("celThemeBaseStyle", saved_style)
+            base_style = str(saved_style)
+            label.setProperty("celTextForeground", QColor(foreground))
+            label.setProperty("celTextBackground", QColor(surface))
+            label.setStyleSheet(f"{base_style}; color: {foreground.name()};")
+        for checkbox in (
+            self.fps_deviation_checkbox,
+            self.fps_primary_checkbox,
+            self.fps_comparison_checkbox,
+            self.interval_primary_checkbox,
+            self.interval_overlay_checkbox,
+        ):
+            checkbox.setProperty("celDisabledForeground", QColor(disabled))
+            checkbox.setProperty("celTextBackground", QColor(surface))
+            checkbox.setStyleSheet(
+                f"QCheckBox {{ color: {foreground.name()}; }} "
+                f"QCheckBox:disabled {{ color: {disabled.name()}; }}"
+            )
+        for plot in (self.fps_plot, self.interval_plot, self.distribution_plot):
+            for axis_name in ("left", "bottom"):
+                axis = plot.plotItem.getAxis(axis_name)
+                axis.setPen(foreground)
+                axis.setTextPen(foreground)
+                axis.setLabel(
+                    text=axis.labelText,
+                    units=axis.labelUnits,
+                    unitPrefix=axis.labelUnitPrefix,
+                    color=foreground.name(),
+                )
+            title = plot.plotItem.titleLabel
+            title.setText(title.text, color=foreground.name())
+            legend = plot.plotItem.legend
+            if legend is not None:
+                for _sample, label in legend.items:
+                    text = getattr(label, "text", "")
+                    if text:
+                        label.setText(text, color=foreground.name())
+
+    def changeEvent(self, event: QEvent) -> None:  # noqa: N802 - Qt API
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
+            if hasattr(self, "fps_plot"):
+                self._update_theme_contrast()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        if self._plot_splitter is not None:
+            orientation = (
+                Qt.Orientation.Vertical
+                if self.width() < 1120
+                else Qt.Orientation.Horizontal
+            )
+            if self._plot_splitter.orientation() != orientation:
+                self._plot_splitter.setOrientation(orientation)
+
+    def _redraw_fps_curves(self, _checked: bool = False) -> None:
+        if self._primary is not None:
+            self._draw_fps_plot(self._primary, self._comparison)
+            self._update_theme_contrast()
+
+    def _redraw_interval_curves(self, _checked: bool = False) -> None:
         if self._primary is not None:
             self._draw_interval_plot(self._primary)
-            self._draw_fps_plot(self._primary, self._comparison)
+            self._update_theme_contrast()
+
+    def _redraw_comparison_curves(self, _checked: bool = False) -> None:
+        """Redraw both plots when both sessions or their underlying data changed."""
+        self._redraw_interval_curves(_checked)
+        self._redraw_fps_curves(_checked)
 
     @staticmethod
     def _option_label(option: ExperimentOption) -> str:
@@ -1097,14 +1404,20 @@ class AnalysisWorkspace(QWidget):
             card.value.setText("—")
         self.warning_label.hide()
         self.details_text.setText("Select a saved experiment to inspect technical details.")
-        self.interval_plot.clear()
-        self.fps_plot.clear()
-        self.distribution_plot.clear()
+        _clear_plot(self.interval_plot)
+        _clear_plot(self.fps_plot)
+        _clear_plot(self.distribution_plot)
         self.comparison_table.setRowCount(0)
         self.comparison_notice.setText("Choose Session B to compare two saved recordings.")
         self.distribution_note.setText("No raw interval distribution is available.")
         self.fps_note.setText("Select an experiment with recorded capture timing.")
         self.interval_note.setText("Select an experiment with recorded frame intervals.")
+        self.fps_controls.set_data_available(False)
+        self.interval_controls.set_data_available(False)
+        if self._expanded_plot_key is not None:
+            self._toggle_plot_focus(self._expanded_plot_key, False)
+            self.fps_controls.set_expanded(False)
+            self.interval_controls.set_expanded(False)
 
 
 def _mode_text(analysis: ExperimentAnalysis) -> str:

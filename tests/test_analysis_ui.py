@@ -4,17 +4,26 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtWidgets import QApplication, QLabel, QScrollArea
 
-from camera_exploration_lab.analysis import load_analysis as real_load_analysis
+from camera_exploration_lab.analysis import (
+    MetricStats,
+    load_analysis as real_load_analysis,
+)
 from camera_exploration_lab.db import Database
 from camera_exploration_lab.models import BackendKind, BenchmarkRecord, CameraIdentity, MeasurementSample, SessionRecord, StreamScope
-from camera_exploration_lab.ui.analysis_workspace import AnalysisWorkspace, _MetricCard, _RateAxisItem, contrast_ratio
+from camera_exploration_lab.ui.analysis_workspace import (
+    AnalysisWorkspace,
+    _MetricCard,
+    _RateAxisItem,
+    contrast_ratio,
+)
 
 
 class AnalysisWorkspaceResponsivenessTests(unittest.TestCase):
@@ -174,7 +183,7 @@ class AnalysisWorkspaceResponsivenessTests(unittest.TestCase):
         counts_before = [len(item.getData()[0]) for item in workspace.fps_plot.plotItem.listDataItems()]
         workspace.fps_deviation_checkbox.setChecked(True)
         self.application.processEvents()
-        self.assertEqual(workspace.fps_plot.plotItem.getAxis("left").labelText, "Deviation from run mean (%)")
+        self.assertEqual(workspace.fps_plot.plotItem.getAxis("left").labelText, "Deviation from session mean (%)")
         axis = workspace.fps_plot.plotItem.getAxis("left")
         self.assertIn("%", axis.tickStrings([-12.5, 0.0, 4.25], 1.0, 1.0)[0])
         self.assertEqual(
@@ -214,6 +223,202 @@ class AnalysisWorkspaceResponsivenessTests(unittest.TestCase):
             self.assertIsNotNone(scroll)
             self.assertGreater(scroll.viewport().width(), 0)
             self.assertGreater(scroll.viewport().height(), 0)
+            self.assertEqual(scroll.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.assertEqual(workspace._plot_splitter.orientation(), Qt.Orientation.Horizontal)
+        workspace.resize(1024, 768)
+        self.application.processEvents()
+        self.assertEqual(workspace._plot_splitter.orientation(), Qt.Orientation.Vertical)
+        workspace.close()
+
+    def test_deviation_math_ranges_and_series_visibility_survive_redraws(self) -> None:
+        workspace = self._track(AnalysisWorkspace(self.database))
+        workspace.show()
+        self.assertTrue(self._process_until(lambda: workspace._primary is not None, timeout=5.0))
+        base = workspace._primary
+        run_a = replace(
+            base,
+            option=replace(base.option, label="PS3 Eye 320x240 GRBG 187 FPS"),
+            duration_seconds=30.0,
+            fps_x_label="Recorder elapsed time (s)",
+            fps_points=((0.5, 187.35), (15.0, 187.50), (29.5, 187.20)),
+            capture_fps_stats=MetricStats(count=3, mean=187.35),
+        )
+        run_b = replace(
+            base,
+            option=replace(base.option, label="PS3 Eye 640x480 GRBG 60 FPS"),
+            duration_seconds=30.0,
+            fps_x_label="Recorder elapsed time (s)",
+            fps_points=((0.5, 60.0), (15.0, 60.6), (29.5, 59.4)),
+            capture_fps_stats=MetricStats(count=3, mean=60.0),
+        )
+        workspace._render(run_a, run_b)
+        plot = workspace.fps_plot
+        self.assertEqual(len(plot.plotItem.listDataItems()), 2)
+        x_range = plot.getViewBox().viewRange()[0]
+        self.assertAlmostEqual(x_range[0], 0.0)
+        self.assertAlmostEqual(x_range[1], 30.0)
+        self.assertIs(plot.plotItem.legend.parentItem(), plot.plotItem.vb)
+
+        workspace.fps_deviation_checkbox.setChecked(True)
+        self.application.processEvents()
+        items = plot.plotItem.listDataItems()
+        self.assertEqual(len(items), 2)
+        by_name = {item.name(): tuple(item.getData()[1]) for item in items}
+        values_a = next(values for name, values in by_name.items() if "Session A" in name)
+        values_b = next(values for name, values in by_name.items() if "Session B" in name)
+        self.assertAlmostEqual(values_a[0], 0.0)
+        self.assertAlmostEqual(values_a[1], 100.0 * (187.50 - 187.35) / 187.35)
+        self.assertAlmostEqual(values_a[2], 100.0 * (187.20 - 187.35) / 187.35)
+        self.assertAlmostEqual(values_b[0], 0.0)
+        self.assertAlmostEqual(values_b[1], 1.0)
+        self.assertAlmostEqual(values_b[2], -1.0)
+        y_range = plot.getViewBox().viewRange()[1]
+        self.assertLess(y_range[0], 0.0)
+        self.assertGreater(y_range[1], 0.0)
+        self.assertEqual(plot.plotItem.getAxis("left").labelText, "Deviation from session mean (%)")
+        self.assertTrue(all("%" in value for value in plot.plotItem.getAxis("left").tickStrings([-1.0, 0.0, 0.08, 1.0], 1.0, 0.1)))
+
+        # Simulate stale absolute-FPS and time limits before changing display mode.
+        plot.getViewBox().setRange(xRange=(50.0, 200.0), yRange=(180.0, 192.0), padding=0.0)
+        workspace.fps_deviation_checkbox.setChecked(False)
+        self.application.processEvents()
+        self.assertEqual(len(plot.plotItem.listDataItems()), 2)
+        self.assertAlmostEqual(plot.getViewBox().viewRange()[0][0], 0.0)
+        self.assertAlmostEqual(plot.getViewBox().viewRange()[0][1], 30.0)
+        absolute_y = plot.getViewBox().viewRange()[1]
+        self.assertLess(absolute_y[0], 60.0)
+        self.assertGreater(absolute_y[1], 187.0)
+        absolute_values = [tuple(item.getData()[1]) for item in plot.plotItem.listDataItems()]
+        self.assertIn((187.35, 187.5, 187.2), absolute_values)
+        self.assertIn((60.0, 60.6, 59.4), absolute_values)
+
+        # A visibility change in one plot must not disturb manual navigation in the other.
+        interval_view = workspace.interval_plot.getViewBox()
+        interval_view.setRange(xRange=(1.0, 2.0), yRange=(4.0, 8.0), padding=0.0)
+        workspace.fps_deviation_checkbox.setChecked(True)
+        workspace.fps_primary_checkbox.setChecked(False)
+        self.application.processEvents()
+        self.assertEqual(interval_view.viewRange()[0], [1.0, 2.0])
+        fps_view = workspace.fps_plot.getViewBox()
+        fps_view.setRange(xRange=(5.0, 10.0), yRange=(-2.0, 2.0), padding=0.0)
+        workspace.interval_primary_checkbox.setChecked(False)
+        self.application.processEvents()
+        self.assertEqual(fps_view.viewRange()[0], [5.0, 10.0])
+        workspace.interval_primary_checkbox.setChecked(True)
+        workspace.fps_primary_checkbox.setChecked(False)
+        self.application.processEvents()
+        self.assertEqual(len(plot.plotItem.listDataItems()), 1)
+        self.assertIn("Session B", plot.plotItem.listDataItems()[0].name())
+        workspace.fps_comparison_checkbox.setChecked(False)
+        self.application.processEvents()
+        self.assertEqual(plot.plotItem.listDataItems(), [])
+        self.assertIn("No capture-rate trace is enabled", workspace.fps_note.text())
+        workspace.fps_comparison_checkbox.setChecked(True)
+        workspace.fps_primary_checkbox.setChecked(True)
+        self.application.processEvents()
+        self.assertEqual(len(plot.plotItem.listDataItems()), 2)
+        self.assertIs(plot.plotItem.legend.parentItem(), plot.plotItem.vb)
+
+        summary_only = replace(
+            run_a,
+            option=replace(run_a.option, source="imported", status="interrupted"),
+            duration_seconds=0.0,
+            fps_points=(),
+            capture_fps_stats=MetricStats(count=0, mean=None),
+            interval_points=(),
+            interval_data_available=False,
+        )
+        workspace._render(summary_only, None)
+        self.assertEqual(plot.plotItem.listDataItems(), [])
+        self.assertIn("No valid capture-FPS time series", workspace.fps_note.text())
+        self.assertFalse(workspace.fps_controls.fit_button.isEnabled())
+        workspace.close()
+
+    def test_navigation_controls_fit_reset_zoom_expand_and_restore(self) -> None:
+        workspace = self._track(AnalysisWorkspace(self.database))
+        workspace.show()
+        self.assertTrue(self._process_until(lambda: workspace._primary is not None, timeout=5.0))
+        initial_sizes = workspace._plot_splitter.sizes()
+        workspace.fps_controls.expand_button.click()
+        self.application.processEvents()
+        self.assertEqual(workspace.fps_controls.expand_button.text(), "Restore Layout")
+        self.assertEqual(workspace._plot_splitter.sizes()[1], 0)
+        workspace.fps_controls.expand_button.click()
+        self.application.processEvents()
+        self.assertEqual(workspace.fps_controls.expand_button.text(), "Expand Plot")
+        self.assertGreater(workspace._plot_splitter.sizes()[1], 0)
+
+        view = workspace.fps_plot.getViewBox()
+        view.setRange(xRange=(50.0, 200.0), yRange=(180.0, 192.0), padding=0.0)
+        workspace.fps_controls.fit_button.click()
+        self.application.processEvents()
+        fitted = view.viewRange()
+        self.assertLess(fitted[0][0], 0.0)
+        self.assertGreater(fitted[0][1], 60.0)
+        before_zoom = fitted[0][1] - fitted[0][0]
+        workspace.fps_controls.zoom_in_button.click()
+        zoomed = view.viewRange()
+        self.assertLess(zoomed[0][1] - zoomed[0][0], before_zoom)
+        workspace.fps_controls.zoom_out_button.click()
+        zoomed_out = view.viewRange()
+        self.assertGreater(zoomed_out[0][1] - zoomed_out[0][0], zoomed[0][1] - zoomed[0][0])
+        workspace.fps_controls.reset_button.click()
+        self.application.processEvents()
+        reset = view.viewRange()
+        self.assertAlmostEqual(reset[0][0], 0.0)
+        self.assertAlmostEqual(reset[0][1], workspace._primary.duration_seconds)
+        self.assertEqual(view.state["mouseMode"], workspace.fps_plot.plotItem.vb.PanMode)
+        self.assertGreater(initial_sizes[0], 0)
+        workspace.close()
+
+    def test_metadata_notes_graph_labels_and_disabled_controls_have_theme_contrast(self) -> None:
+        workspace = self._track(AnalysisWorkspace(self.database))
+        workspace.show()
+        self.assertTrue(self._process_until(lambda: workspace._primary is not None, timeout=5.0))
+        dark = QPalette()
+        dark.setColor(QPalette.ColorRole.Window, QColor("#22262d"))
+        dark.setColor(QPalette.ColorRole.WindowText, QColor("#c4c8ce"))
+        dark.setColor(QPalette.ColorRole.Text, QColor("#c4c8ce"))
+        light = QPalette()
+        light.setColor(QPalette.ColorRole.Window, QColor("#f3f4f6"))
+        light.setColor(QPalette.ColorRole.WindowText, QColor("#25282c"))
+        light.setColor(QPalette.ColorRole.Text, QColor("#25282c"))
+        for palette in (dark, light):
+            workspace.setPalette(palette)
+            workspace._update_theme_contrast()
+            labels = [
+                label for label in workspace.findChildren(QLabel)
+                if label.property("celThemeText")
+            ]
+            self.assertGreaterEqual(len(labels), 15)
+            for label in labels:
+                foreground = QColor(label.property("celTextForeground"))
+                background = QColor(label.property("celTextBackground"))
+                self.assertGreaterEqual(contrast_ratio(foreground, background), 4.5, label.text())
+            theme_foreground = QColor(labels[0].property("celTextForeground")).name()
+            for checkbox in (
+                workspace.fps_deviation_checkbox,
+                workspace.fps_primary_checkbox,
+                workspace.fps_comparison_checkbox,
+                workspace.interval_primary_checkbox,
+                workspace.interval_overlay_checkbox,
+            ):
+                foreground = QColor(checkbox.property("celDisabledForeground"))
+                background = QColor(checkbox.property("celTextBackground"))
+                self.assertGreaterEqual(contrast_ratio(foreground, background), 4.5)
+            for plot in (workspace.fps_plot, workspace.interval_plot, workspace.distribution_plot):
+                self.assertEqual(plot.plotItem.titleLabel.opts["color"], theme_foreground)
+                for axis_name in ("left", "bottom"):
+                    axis = plot.plotItem.getAxis(axis_name)
+                    pen = axis.textPen()
+                    surface = palette.color(QPalette.ColorRole.Window)
+                    self.assertGreaterEqual(contrast_ratio(pen.color(), surface), 4.5)
+                    self.assertIn(pen.color().name(), axis.label.toHtml().lower())
+            legend = workspace.fps_plot.plotItem.legend
+            if legend is not None:
+                for _sample, label in legend.items:
+                    html = label.item.toHtml().lower()
+                    self.assertIn(f"color:{theme_foreground}", html)
         workspace.close()
 
     def test_filtering_and_empty_comparison_state(self) -> None:
@@ -329,6 +534,7 @@ class AnalysisWorkspaceResponsivenessTests(unittest.TestCase):
         labels = axis.tickStrings([0.0, -12.5, 0.5, 125.0], 1.0, 1.0)
         self.assertEqual(labels, ["0%", "-12.5%", "0.50%", "125%"])
         self.assertTrue(all("e" not in label.lower() for label in labels))
+        self.assertFalse(axis.autoSIPrefix)
 
 
 if __name__ == "__main__":

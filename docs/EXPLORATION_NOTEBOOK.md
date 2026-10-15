@@ -154,3 +154,10 @@ Add concise entries as decisions are made or discoveries are confirmed:
 ```
 
 Update an existing `CEL-###` item when possible. Mark proposed work clearly, preserve prior decisions when superseded, and keep run-level data in the local database rather than this document.
+
+### 2026-10-14 — Plot range and navigation review
+
+- Context: physical Bazzite review found percentage curves near zero hidden under prior absolute-FPS zoom ranges, elapsed axes retaining stale limits, and graph controls difficult to discover.
+- Evidence: PyQtGraph 0.14.0 `PlotItem.clear()` leaves ViewBox manual ranges intact and retains its legend object reference after detaching that legend from the ViewBox.
+- Decision: calculate each session's percentage deviation explicitly against its own mean; rebuild the legend after clearing; reset the view after relevant data/mode changes; keep manual navigation until reset or a relevant redraw.
+- Interpretation boundary: experiments are aligned to their own recorded elapsed clocks and remain independent recordings. No synchronization or sensor latency is inferred.

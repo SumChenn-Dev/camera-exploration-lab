@@ -214,7 +214,17 @@ def rate_deviation_percent(
     """Map recorded FPS points to deviation from the session-wide observed mean."""
     if mean_fps is None or not math.isfinite(mean_fps) or mean_fps <= 0:
         return ()
-    return tuple((elapsed, (fps / mean_fps - 1.0) * 100.0) for elapsed, fps in points)
+    result = []
+    for point in points:
+        try:
+            elapsed, fps = point
+            elapsed_value, fps_value = float(elapsed), float(fps)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(elapsed_value) or not math.isfinite(fps_value):
+            continue
+        result.append((elapsed_value, 100.0 * (fps_value - mean_fps) / mean_fps))
+    return tuple(result)
 
 
 def load_analysis(

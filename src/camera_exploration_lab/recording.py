@@ -27,6 +27,7 @@ from .models import (
     new_id,
     utc_now_iso,
 )
+from .recording_ownership import RecordingOwnership
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,7 @@ class ExperimentRecorder:
         self._read_failures = 0
         self._benchmark_id = new_id()
         self._session_id = new_id()
+        self._ownership: RecordingOwnership | None = None
 
         requested = {
             "width": mode.width,
@@ -208,9 +210,17 @@ class ExperimentRecorder:
             )
             for key in ("width", "height", "fps", "pixel_format")
         ]
-        self.database.begin_live_experiment(
-            camera, session, benchmark, settings, seen_at=self._started_at
-        )
+        self._ownership = self.database.acquire_recording_ownership(owner_kind="single_camera")
+        owner_metadata["recording_owner_token"] = self._ownership.owner_token
+        session = replace(session, metadata=owner_metadata)
+        try:
+            self.database.begin_live_experiment(
+                camera, session, benchmark, settings, seen_at=self._started_at,
+                ownership=self._ownership,
+            )
+        except BaseException:
+            self._release_ownership()
+            raise
         self._snapshot = replace(
             self._snapshot, benchmark_id=self._benchmark_id, session_id=self._session_id
         )
@@ -219,8 +229,35 @@ class ExperimentRecorder:
             name=f"celab-recorder-{self._benchmark_id[:8]}",
             daemon=True,
         )
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            try:
+                self.database.finish_live_experiment(
+                    self._benchmark_id,
+                    ended_at=self._now_iso(),
+                    duration_seconds=0.0,
+                    status="failed",
+                    termination_reason="writer_start_failure",
+                    ownership=self._ownership,
+                )
+            except Exception:
+                logger.exception("Could not finalize writer-start failure for %s", self._benchmark_id)
+            else:
+                self._release_ownership()
+            raise
         logger.info("Started experiment %s (%s)", name.strip(), self._benchmark_id)
+
+    def _release_ownership(self) -> None:
+        ownership = self._ownership
+        if ownership is None:
+            return
+        try:
+            ownership.release(ownership.owner_token)
+        except Exception:
+            logger.exception("Could not release recording ownership for %s", self._benchmark_id)
+        else:
+            self._ownership = None
 
     def snapshot(self) -> RecordingSnapshot:
         with self._lock:
@@ -394,7 +431,7 @@ class ExperimentRecorder:
                     for sample in self._samples_for(event):
                         batch.append(sample)
                         if len(batch) == self._batch_size:
-                            self.database.record_measurements_batch(batch)
+                            self.database.record_measurements_batch(batch, ownership=self._ownership)
                             batch.clear()
                 finally:
                     self._queue.task_done()
@@ -403,7 +440,7 @@ class ExperimentRecorder:
                     break
 
             if batch:
-                self.database.record_measurements_batch(batch)
+                self.database.record_measurements_batch(batch, ownership=self._ownership)
                 batch.clear()
             with self._lock:
                 terminal_status = self._terminal_status
@@ -424,7 +461,9 @@ class ExperimentRecorder:
                 duration_seconds=elapsed,
                 status=terminal_status.value,
                 termination_reason=terminal_reason,
+                ownership=self._ownership,
             )
+            self._release_ownership()
             self._set_snapshot(
                 state=terminal_status,
                 elapsed_seconds=elapsed,
@@ -451,8 +490,11 @@ class ExperimentRecorder:
                     duration_seconds=self._elapsed(),
                     status="failed",
                     termination_reason="database_write_failure",
+                    ownership=self._ownership,
                 )
             except Exception:
                 # Keep the SQLite row as running; next launch's recovery marks it
                 # interrupted. The failed writer never marks it completed.
                 logger.exception("Could not close failed experiment %s", self._benchmark_id)
+            else:
+                self._release_ownership()

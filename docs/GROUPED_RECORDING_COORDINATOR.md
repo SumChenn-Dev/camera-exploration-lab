@@ -1,5 +1,10 @@
 # CEL-013 Pass 2B.1 / 2B.2 — Grouped Coordinator and Guarded Capture Adapter
 
+This document includes the original Pass 2B.1 coordinator baseline. The Pass
+2B.3 section below supersedes earlier statements that the existing
+single-camera recorder does not share recording ownership or that recovery
+inspection is absent.
+
 ## Scope and activation boundary
 
 Pass 2B.1 added the camera-free coordinator for the schema-v3 grouped-recording repository. Pass 2B.2 adds a capture-event adapter that can subscribe to the timing callback of an already-running `OpenCVCaptureWorker`, plus a two-stream orchestration bridge. This code is **not** connected to `MultiCameraWorkspace`, PySide6, History, Analysis, or a GUI recording control. The only executable entry point is a developer harness that creates its own fresh marked synthetic database in a temporary directory. No physical camera or ordinary application database is opened.
@@ -47,7 +52,7 @@ A measurement or metadata transaction exception is terminal for this coordinator
 
 The writer is a daemon thread and shutdown joins are bounded. `cancel()` returns false if it cannot confirm finalization by its deadline; callers must treat that as unresolved, not as success. A blocked SQLite call can still outlive the caller's deadline until SQLite returns or the process exits. If the thread later resumes, it may finish the already queued interrupted finalization. A process exit during the stall leaves the lease and nonterminal group for review.
 
-## Lease semantics and recovery limit
+## Pass 2B.1 lease semantics and recovery limit (historical baseline)
 
 Lease acquisition uses a SQLite `BEGIN IMMEDIATE` transaction and the schema-v3 singleton lease row, so two grouped coordinators using separate connections or processes against the same database cannot both acquire it. Grouped repository writes check the session and owner token inside an immediate write transaction. Lease age is not an ownership test. There is no automatic lease stealing or stale-owner recovery.
 
@@ -138,3 +143,15 @@ Each normal case used a 2,048-event capacity per stream and had no rejections; `
 ## Remaining work and gate
 
 This pass does not add the Grouped Recording UI, a shared lease for single-camera recording, stale-lease recovery, crash-tail classification, periodic durable counters, preview metrics, History grouping, Analysis overlays, media recording, or production migration. The schema-v3 grouped lease protects grouped coordinators, but the existing v2 `ExperimentRecorder` does not participate; the synthetic harness’s private temporary DB is the only supported adapter use. Before production activation, a later reviewed stage must define one ownership policy shared by both recorders, a separately approved real-database migration, asynchronous GUI lifecycle control, and crash/recovery behavior. User-reported Pass 1 validation is not evidence for grouped persistence, hardware synchronization, native V4L2 timestamps, or PS3 Eye 187 FPS dual capture.
+
+## Pass 2B.3 — shared ownership and recovery inspection
+
+The existing v2 `ExperimentRecorder` and v3 `GroupedRecordingCoordinator` now acquire the same cooperative, nonblocking Linux `flock` on the SQLite database inode. This is a process lock, so same-process instances, separate application processes, and symlink/hardlink aliases to the same file contend consistently. It does not require a new table or v2 migration. The grouped coordinator additionally acquires the existing v3 SQL lease with the same unique owner token; the order is always inode lock first, SQL lease second, then short writer transactions. The SQL group finalization deletes its durable lease in the same transaction as terminal state; only after that commit does the coordinator release the inode lock.
+
+Single-camera live session creation writes the owner token into session metadata. The database rejects live-run creation without an active owner and rejects sample insertion/finalization for a running live experiment if the supplied handle or persisted token does not match. The capture callback still submits timing metadata only to its existing bounded queue; the lock is checked by the background writer, never by a camera callback. The grouped coordinator checks its active inode handle before measurement batches and lifecycle writes. A writer or transaction failure retains both shared ownership and, for schema v3, the durable SQL lease whenever finalization is not confirmed. A successful `failed` or `interrupted` terminal commit can release ownership; unresolved state cannot.
+
+`Database.inspect_recording_recovery()` is read-only. It probes the inode lock, then returns IDs, state, sample counts, last committed timing bounds, queue/persistence-loss counters, the last grouped event, and an explicit classification. It does not clear a stale v3 SQL lease. A held lock plus a nonterminal state means an active owner; a stale durable lease without that lock is indeterminate and blocks another recorder. The existing v2 startup recovery now takes the same lock and skips recovery while a current owner holds it. A dead v2 running record is classified indeterminate before the existing startup recovery marks it interrupted using the last committed sample as a lower-bound duration.
+
+The recommended grouped entry point is `GroupedRecordingCoordinator.create_and_start()`: it obtains shared ownership before inserting the parent and two child streams. If SQL lease acquisition fails before the writer starts, it removes only that factory-created pending group under the same handle. The lower-level repository creation and direct SQL lease APIs remain available for synthetic fixture construction; they are not a production recording boundary. The capture adapter is still absent from the GUI, and no Record Both action is available.
+
+This lock is cooperative. An older executable, unrelated SQLite writer, copied database file, or filesystem with unreliable `flock` behavior may not honor it. Production must use a local supported filesystem and stop older app instances before activation. There is no age-based stale-lock takeover, no automatic SQL-lease cleanup, and no GUI recovery control. Recovery inspection is a point-in-time read; a future modifying recovery operation must acquire and retain the shared lock from revalidation through explicit user confirmation and a committed audit event. See `09_PRODUCTION_ACTIVATION_AND_RECOVERY.md` in the separate design directory for the planned production activation and recovery gate.

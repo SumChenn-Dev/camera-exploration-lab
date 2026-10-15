@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .db import Database, SCHEMA, SCHEMA_VERSION
+from .recording_ownership import RecordingOwnershipBusyError, RecordingOwnershipError
 
 GROUPED_SCHEMA_VERSION = 3
 # Test fixtures must mark a database with this application_id before migration.
@@ -558,6 +559,32 @@ def migrate_synthetic_database_to_v3(
     *,
     _after_step: Callable[[str], None] | None = None,
 ) -> MigrationReport:
+    """Run the marked synthetic migration while holding the shared file lock."""
+    try:
+        ownership = database.acquire_recording_ownership(
+            owner_kind="synthetic_schema_migration", check_recovery=False
+        )
+    except RecordingOwnershipBusyError as exc:
+        raise SchemaMigrationError(
+            "synthetic migration refused while another recorder owns the database"
+        ) from exc
+    except RecordingOwnershipError as exc:
+        raise SchemaMigrationError(
+            "synthetic migration requires an existing, lockable test database"
+        ) from exc
+    try:
+        return _migrate_synthetic_database_to_v3_locked(
+            database, _after_step=_after_step
+        )
+    finally:
+        ownership.release(ownership.owner_token)
+
+
+def _migrate_synthetic_database_to_v3_locked(
+    database: Database,
+    *,
+    _after_step: Callable[[str], None] | None = None,
+) -> MigrationReport:
     """Explicitly migrate a marked synthetic test database to grouped schema v3.
 
     This function is deliberately not called by Database.initialize(), GUI
@@ -617,6 +644,14 @@ def migrate_synthetic_database_to_v3(
             elif source_version == SCHEMA_VERSION:
                 _validate_v2(connection)
                 _reject_partial_v3(connection)
+                unresolved = connection.execute(
+                    """SELECT 1 FROM sessions s JOIN benchmark_runs b ON b.session_id=s.id
+                       WHERE s.source='live_experiment' AND b.status='running' LIMIT 1"""
+                ).fetchone()
+                if unresolved is not None:
+                    raise SchemaMigrationError(
+                        "synthetic migration refused while a v2 live experiment is unresolved"
+                    )
                 source_for_report = SCHEMA_VERSION
             else:
                 raise SchemaMigrationError(

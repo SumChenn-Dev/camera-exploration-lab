@@ -343,6 +343,7 @@ class GroupedCoordinatorTests(unittest.TestCase):
         self.assertEqual(snapshot.state, CoordinatorState.FAILED)
         self.assertFalse(snapshot.writer_healthy)
         self.assertTrue(snapshot.lease_held)
+        self.assertTrue(snapshot.shared_owner_held)
         self.assertGreater(snapshot.streams[0].persistence_losses, 0)
         self.assertIn("OperationalError", snapshot.error)
         self.assertNotIn(str(self.db_path), snapshot.error)

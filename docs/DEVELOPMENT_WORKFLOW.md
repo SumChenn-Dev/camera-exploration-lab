@@ -141,3 +141,16 @@ DATABASE="/path/to/the/existing/history.sqlite3"
 ```
 
 Do not copy the database or backups into the public checkout or Git. The application defaults to a per-user data directory only when no database argument is provided. Fresh-host installation is documented in the README.
+
+## CEL-013 Pass 2B.3 ownership and recovery checks
+
+The v2 single-camera recorder and the v3 grouped coordinator share a cooperative Linux inode lock. The lock is taken before any live experiment rows or grouped SQL leases are created, and it remains held until a confirmed terminal transaction commits. `Database.inspect_recording_recovery()` is a read-only Python API; it does not clear leases, modify status, or infer sensor timing. The normal GUI does not expose schema-v3 activation, grouped recording, or recovery actions. Do not run the v3 migration or point a synthetic harness at the application's existing database.
+
+Focused regression coverage uses the project's standard unittest command:
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONUNBUFFERED=1 PYTHONPATH="$PWD/src:$PWD" \
+  "$VENV/bin/python" -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+Synthetic tests use temporary databases for same-process and cross-process contention, symlink/hardlink aliases, terminal release, abandoned single/grouped recordings, and read-only recovery inspection. The `flock` layer coordinates only application versions that implement it on filesystems with reliable Linux advisory-lock semantics. It is not a universal lock for older CEL versions, unrelated SQLite tools, copied database files, or unsupported network filesystems. An abandoned v3 SQL lease remains blocking until an explicit recovery workflow is reviewed and approved.

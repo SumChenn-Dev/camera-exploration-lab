@@ -21,10 +21,13 @@ from .grouped_recording import (
     GroupStatus,
     GroupedExperimentRecord,
     GroupedExperimentRepository,
+    GroupedExperimentSpec,
     RecordingLease,
+    RecordingLeaseBusyError,
     StreamStatus,
 )
 from .models import MeasurementSample, StreamScope, utc_now_iso
+from .recording_ownership import RecordingOwnership, RecordingOwnershipBusyError
 
 
 DEFAULT_STREAM_QUEUE_CAPACITY = 2048
@@ -101,6 +104,7 @@ class CoordinatorSnapshot:
     writer_cpu_ns: int
     streams: tuple[StreamCoordinatorSnapshot, StreamCoordinatorSnapshot]
     error: str | None = None
+    shared_owner_held: bool = False
 
 
 @dataclass(slots=True)
@@ -151,6 +155,7 @@ class GroupedRecordingCoordinator:
         clock_ns: Callable[[], int] = time.monotonic_ns,
         now_iso: Callable[[], str] = utc_now_iso,
         command_timeout_seconds: float = COMMAND_TIMEOUT_SECONDS,
+        ownership: RecordingOwnership | None = None,
     ) -> None:
         if isinstance(queue_capacity, bool) or not isinstance(queue_capacity, int) or queue_capacity < 1:
             raise ValueError("queue_capacity must be a positive integer")
@@ -222,22 +227,89 @@ class GroupedRecordingCoordinator:
         self._writer_healthy = True
         self._writer_cpu_ns = 0
         self._lease: RecordingLease | None = None
+        self._ownership: RecordingOwnership | None = ownership
         self._thread: threading.Thread | None = None
         self._thread_closed = threading.Event()
         self._final_record: GroupedExperimentRecord | None = None
         self._last_turn = "B"
 
+    @classmethod
+    def create_and_start(
+        cls,
+        repository: GroupedExperimentRepository,
+        spec: GroupedExperimentSpec,
+        **kwargs: Any,
+    ) -> GroupedRecordingCoordinator:
+        """Acquire shared ownership before creating any experiment rows."""
+        ownership = repository.database.acquire_recording_ownership(owner_kind="grouped")
+        group = None
+        coordinator = None
+        try:
+            group = repository.create_group(spec, ownership=ownership)
+            coordinator = cls(repository, group.session_id, ownership=ownership, **kwargs)
+            coordinator.start()
+            return coordinator
+        except BaseException:
+            can_discard = coordinator is None or (
+                coordinator._lease is None
+                and (coordinator._thread is None or coordinator._thread.ident is None)
+            )
+            if group is None:
+                try:
+                    ownership.release(ownership.owner_token)
+                except Exception:
+                    pass
+            elif can_discard:
+                try:
+                    repository.delete_unstarted_group(
+                        group.session_id, ownership=ownership,
+                        owner_token=ownership.owner_token,
+                    )
+                except Exception:
+                    # Preserve the held OS owner if cleanup is uncertain.
+                    pass
+                else:
+                    try:
+                        ownership.release(ownership.owner_token)
+                    except Exception:
+                        pass
+            raise
+
+    def _assert_recording_ownership(self) -> None:
+        if self._ownership is None:
+            raise CoordinatorStateError("grouped writer has no shared database owner")
+        self._ownership.assert_active(self.repository.database)
+
     def start(self) -> None:
-        """Acquire the database lease, then start the single writer thread."""
+        """Acquire common and schema-v3 ownership before starting the writer."""
+        acquired_here = False
         with self._lock:
             if self._state != CoordinatorState.CREATED:
                 raise CoordinatorStateError("coordinator can only be started once")
-            lease = self.repository.acquire_recording_lease(
-                self.session_id,
-                owner_pid=os.getpid(),
-                owner_process_start_ticks=_process_start_ticks(),
-                acquired_at=self._now_iso(),
-            )
+            if self._ownership is None:
+                try:
+                    self._ownership = self.repository.database.acquire_recording_ownership(
+                        owner_kind="grouped"
+                    )
+                except RecordingOwnershipBusyError as exc:
+                    raise RecordingLeaseBusyError(
+                        "another recorder owns this database"
+                    ) from exc
+                acquired_here = True
+            self._assert_recording_ownership()
+            try:
+                lease = self.repository.acquire_recording_lease(
+                    self.session_id,
+                    owner_pid=os.getpid(),
+                    owner_process_start_ticks=_process_start_ticks(),
+                    acquired_at=self._now_iso(),
+                    owner_token=self._ownership.owner_token,
+                )
+            except BaseException:
+                if acquired_here and self._ownership is not None:
+                    self._ownership.release(self._ownership.owner_token)
+                    self._ownership = None
+                raise
             self._lease = lease
             self._state = CoordinatorState.RUNNING
             self._thread = threading.Thread(
@@ -250,8 +322,15 @@ class GroupedRecordingCoordinator:
             except BaseException:
                 self._state = CoordinatorState.FAILED
                 self._writer_healthy = False
-                self.repository.release_recording_lease(lease.owner_token)
+                try:
+                    self.repository.release_recording_lease(lease.owner_token)
+                except Exception:
+                    # The durable lease and shared owner both remain for review.
+                    raise
                 self._lease = None
+                if acquired_here and self._ownership is not None:
+                    self._ownership.release(self._ownership.owner_token)
+                    self._ownership = None
                 raise
             started_event = _Command(
                 "event",
@@ -627,6 +706,7 @@ class GroupedRecordingCoordinator:
                 writer_cpu_ns=self._writer_cpu_ns,
                 streams=stream_snapshots,  # type: ignore[arg-type]
                 error=self._writer_error,
+                shared_owner_held=(self._ownership is not None and not self._ownership.released),
             )
 
     def _enqueue_sample_locked(
@@ -846,6 +926,7 @@ class GroupedRecordingCoordinator:
         if not batch:
             return
         assert self._lease is not None
+        self._assert_recording_ownership()
         written = self.repository.record_stream_measurements(
             self.session_id, slot, batch, owner_token=self._lease.owner_token
         )
@@ -861,6 +942,7 @@ class GroupedRecordingCoordinator:
 
     def _process_command(self, command: _Command) -> None:
         assert self._lease is not None
+        self._assert_recording_ownership()
         assert command.elapsed_ns is not None and command.observed_at is not None
         if command.operation == "event":
             assert command.event_type is not None
@@ -939,10 +1021,20 @@ class GroupedRecordingCoordinator:
                 termination_reason=command.reason_code or "manual_stop",
                 owner_token=self._lease.owner_token,
             )
+            owner_release_error = None
+            if self._ownership is not None:
+                try:
+                    self._ownership.release(self._ownership.owner_token)
+                except Exception as exc:
+                    owner_release_error = f"shared_owner_release_failed:{type(exc).__name__}"
+                else:
+                    self._ownership = None
             with self._progress:
                 self._final_record = record
                 self._state = CoordinatorState.FINALIZED
                 self._lease = None
+                if owner_release_error is not None:
+                    self._writer_error = owner_release_error
                 self._progress.notify_all()
             command.result = record
             command.done.set()
@@ -959,6 +1051,7 @@ class GroupedRecordingCoordinator:
         elapsed_ns: int | None = None,
     ) -> None:
         assert self._lease is not None
+        self._assert_recording_ownership()
         increments: dict[str, int] = {}
         with self._lock:
             for counter in _COUNTERS:
@@ -1057,6 +1150,12 @@ class GroupedRecordingCoordinator:
         # nonterminal durable group prevent a false success and stale stealing.
         lease = self._lease
         if lease is not None:
+            if self._ownership is None:
+                return
+            try:
+                self._assert_recording_ownership()
+            except Exception:
+                return
             for slot in ("A", "B"):
                 try:
                     increments: dict[str, int] = {}

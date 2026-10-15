@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from .db import Database, serialize_json
 from .models import BackendKind, CameraIdentity, MeasurementSample, SQLITE_INT_MAX, utc_now_iso
+from .recording_ownership import RecordingOwnership
 from .schema_migrations import GROUPED_SCHEMA_VERSION
 
 
@@ -287,7 +288,12 @@ class GroupedExperimentRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def create_group(self, spec: GroupedExperimentSpec) -> GroupedExperimentRecord:
+    def create_group(
+        self,
+        spec: GroupedExperimentSpec,
+        *,
+        ownership: RecordingOwnership | None = None,
+    ) -> GroupedExperimentRecord:
         _required_text("experiment label", spec.label)
         _required_text("clock_epoch_id", spec.clock_epoch_id)
         if spec.duration_target_seconds is not None and (
@@ -325,6 +331,8 @@ class GroupedExperimentRepository:
 
         with self.database.connect() as connection:
             self._require_v3(connection)
+            if ownership is not None:
+                ownership.assert_active(self.database)
             connection.execute(
                 """INSERT INTO sessions
                    (id, camera_id, label, source, started_at, ended_at, created_at, notes, metadata_json)
@@ -397,6 +405,56 @@ class GroupedExperimentRepository:
         if group is None:
             raise GroupInvariantError("created group could not be read back")
         return group
+
+    def delete_unstarted_group(
+        self,
+        session_id: str,
+        *,
+        ownership: RecordingOwnership,
+        owner_token: str,
+    ) -> None:
+        """Remove only a factory-created group that never acquired a writer lease."""
+        ownership.assert_active(self.database, owner_token)
+        with self.database.connect() as connection:
+            self._require_v3(connection)
+            ownership.assert_active(self.database, owner_token)
+            parent = connection.execute(
+                "SELECT status FROM group_recordings WHERE session_id=?", (session_id,)
+            ).fetchone()
+            if parent is None or parent["status"] != GroupStatus.PENDING:
+                raise GroupInvariantError("only an unstarted pending group can be discarded")
+            streams = connection.execute(
+                "SELECT benchmark_id, stream_status FROM benchmark_streams WHERE session_id=? ORDER BY slot",
+                (session_id,),
+            ).fetchall()
+            if len(streams) != 2 or any(
+                row["stream_status"] != StreamStatus.PENDING for row in streams
+            ):
+                raise GroupInvariantError("group already contains recording lifecycle changes")
+            run_ids = tuple(str(row["benchmark_id"]) for row in streams)
+            placeholders = ",".join("?" for _ in run_ids)
+            if connection.execute(
+                f"SELECT 1 FROM measurements WHERE benchmark_id IN ({placeholders}) LIMIT 1",
+                run_ids,
+            ).fetchone():
+                raise GroupInvariantError("group already contains measurement rows")
+            if connection.execute(
+                "SELECT 1 FROM experiment_events WHERE session_id=? "
+                "AND event_type!='group_created' LIMIT 1",
+                (session_id,),
+            ).fetchone():
+                raise GroupInvariantError("group already contains recording events")
+            lease = connection.execute(
+                "SELECT session_id, owner_token FROM recording_leases WHERE lease_key=1"
+            ).fetchone()
+            if lease is not None:
+                if lease["session_id"] != session_id or lease["owner_token"] != owner_token:
+                    raise RecordingLeaseOwnershipError("group has a different active recording lease")
+                connection.execute(
+                    "DELETE FROM recording_leases WHERE lease_key=1 AND owner_token=?",
+                    (owner_token,),
+                )
+            connection.execute("DELETE FROM sessions WHERE id=?", (session_id,))
 
     @staticmethod
     def _require_v3(connection: sqlite3.Connection) -> None:

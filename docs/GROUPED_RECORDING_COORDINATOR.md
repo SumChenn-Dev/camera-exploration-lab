@@ -1,16 +1,20 @@
-# CEL-013 Pass 2B.1 — Synthetic Grouped Recording Coordinator
+# CEL-013 Pass 2B.1 / 2B.2 — Grouped Coordinator and Guarded Capture Adapter
 
 ## Scope and activation boundary
 
-This milestone adds a camera-free coordinator for the schema-v3 grouped-recording repository. It accepts synthetic timing events and uses temporary synthetic databases in tests and benchmarks. It is not connected to `OpenCVCaptureWorker`, `MultiCameraWorkbench`, PySide6, History, Analysis, or any GUI recording control. No camera is opened by this module.
+Pass 2B.1 added the camera-free coordinator for the schema-v3 grouped-recording repository. Pass 2B.2 adds a capture-event adapter that can subscribe to the timing callback of an already-running `OpenCVCaptureWorker`, plus a two-stream orchestration bridge. This code is **not** connected to `MultiCameraWorkspace`, PySide6, History, Analysis, or a GUI recording control. The only executable entry point is a developer harness that creates its own fresh marked synthetic database in a temporary directory. No physical camera or ordinary application database is opened.
 
-Normal application startup remains on schema v2. `Database.initialize()` does not call the explicit synthetic-only v3 migration. There is no GUI or CLI entry point for the coordinator. Do not point it at a production history database. CEL-013 Pass 1 physical validation remains a prerequisite before implementation that relies on live dual-capture behavior.
+Normal application startup remains on schema v2. `Database.initialize()` does not call the explicit synthetic-only v3 migration. The harness requires `--synthetic-only`, has no `--database` argument, refuses a non-fresh harness directory, and deletes its temporary database at exit. User-reported Bazzite Pass 1 validation showed concurrent preview at 100 FPS requested/readback for the PS3 Eye and 30 FPS requested/readback for the AVerMedia, plus independent stop behavior. This is not evidence for grouped recording, high-rate dual capture, driver timestamps, or synchronization.
 
 ## Ownership and API boundary
 
-`GroupedRecordingCoordinator` composes the existing `GroupedExperimentRepository`; it does not introduce another schema, measurement insertion path, or camera backend. The caller first creates a group with two participant streams. `coordinator.start()` then acquires the database-wide lease and starts one writer thread. After each capture worker independently confirms readiness, an orchestration caller reports `start_stream("A")` and `start_stream("B")`. A synthetic or future capture callback submits only timestamp metadata through `submit_frame_arrival()` or `submit_read_failure()`.
+`GroupedRecordingCoordinator` composes the existing `GroupedExperimentRepository`; it does not introduce another schema, measurement insertion path, or camera backend. The caller first creates a group with two participant streams. `coordinator.start()` then acquires the database-wide lease and starts one writer thread. `GroupedCaptureRecordingBridge.start_recording()` accepts two already-active worker objects, then starts or explicitly fails each coordinator stream. Each `CaptureEventAdapter` claims that worker’s single timing-listener slot and directly submits only timestamp metadata to the coordinator.
 
-The producer calls do not perform SQLite operations, wait for queue space, enqueue frame images, or emit one Qt signal per frame. They briefly update stream-local counters/sequences and use `put_nowait()` on that stream's bounded queue. Start/stop/finalize methods wait for writer acknowledgements and therefore must run outside a future Qt event callback; a GUI integration will need an asynchronous Qt worker or equivalent orchestration boundary.
+The producer calls do not perform SQLite operations, wait for queue space, enqueue frame images, or emit one Qt signal per frame. They briefly update stream-local counters/sequences and use `put_nowait()` on that stream’s bounded queue. Bridge/coordinator start, stop, failure and finalization methods wait for writer acknowledgements and therefore must run outside a Qt event callback; a future GUI integration needs a dedicated orchestration worker. `stop_recording()` detaches timing only and leaves capture/preview workers running. `capture_ended(slot, ...)` finalizes one child while leaving the other worker and adapter active. `shutdown()` closes callback intake before bounded coordinator cancellation. No bridge method requests that a camera open, close, or change format.
+
+`OpenCVCaptureWorker` samples `time.monotonic_ns()` immediately after `VideoCapture.read()` returns and creates a small `CaptureTimingEvent`. The adapter passes that event’s monotonic timestamp and UTC marker unchanged; it does not read a preview timer, render a frame, copy pixels, or submit an image. One successful capture callback causes at most one `submit_frame_arrival()` call. Read failures call `submit_read_failure()` and stay separate from sample-queue or database loss. Driver/source timestamp fields remain NULL.
+
+The worker’s legacy `set_timing_listener()` remains available to the single-camera recorder. New subscriptions are exclusive and token-owned: the adapter cannot overwrite an existing listener, and its close operation cannot clear a listener that another owner installed later. Capture callbacks already copied by the worker are guarded after detach. Detach waits a bounded time for callbacks already inside submission before the bridge asks the coordinator to stop/finalize.
 
 Useful API calls are:
 
@@ -25,7 +29,7 @@ coordinator.stop_stream("B", host_monotonic_ns=recording_stop_b_ns)
 group = coordinator.finalize(reason_code="manual_stop")
 ```
 
-These APIs are currently exercised only by synthetic tests and the synthetic benchmark command below.
+The coordinator APIs and bridge are exercised with fake workers in camera-free tests. The developer harness below is the only runnable integration demonstration; it never accepts a user database path or contacts a camera.
 
 ## Bounded queues and writer policy
 
@@ -107,6 +111,30 @@ A separate 30-second-equivalent 187 + 30 run committed 6,510/6,510 rows at about
 
 The injected slow-writer test fills a two-slot queue deterministically, confirms the next item is rejected, then releases the writer. Subsequent attempts are accepted, both streams drain independently, the lost sequence remains visible, and the final group is partial rather than complete. The database-failure test simulates a disk-full-style transaction exception and confirms the writer terminates, incomplete status is best-effort persisted, accepted rows are not falsely retried, and the lease remains held. Separate-process contention tests confirm a second process cannot acquire a lease while the first owner is active. Shutdown-race tests cover cancellation while an already queued stop waits behind a deliberately blocked synthetic write.
 
+## Pass 2B.2 capture-adapter checks
+
+Run the synthetic adapter/performance harness from the public checkout:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+  "$VENV/bin/python" tools/benchmark_capture_event_adapter.py \
+  --synthetic-only --seconds 30
+```
+
+The required acknowledgement stops argument parsing before any directory is created when it is absent. The tool has no database argument, no fallback to the application database, and no capture or OpenCV code path. It creates a new marked v3 SQLite file per scenario under a fresh temporary root and removes it on exit. It simulates 30 elapsed seconds in accelerated time and reports callback time, writer throughput/CPU, queue depth, loss, SQLite integrity, file size, finalization time, and traced Python peak memory. These results describe only this synthetic SQLite path.
+
+The 30-second-equivalent cases cover 100+24, 187+24, and 187+30 synthetic timing events per second. A controlled burst holds the first SQLite write, fills only stream A’s 64-item queue, verifies B remains loss-free, then releases the writer and confirms later A samples are accepted with the original sequence gap retained. Any rejected sample prevents complete status. The burst does not simulate camera performance.
+
+One local run produced these results (database sizes are bytes; rates and timings are synthetic):
+
+| Scenario | Samples committed | Callback p95 | Persisted rows/s | Queue high-water A/B | SQLite size | Writer CPU | Traced peak | Finalize |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 + 24 | 3,720 / 3,720 | 39.1 µs | 17,162 | 413 / 100 | 1,859,584 | 0.094 s | 0.36 MB | 10.4 ms |
+| 187 + 24 | 6,330 / 6,330 | 35.4 µs | 17,932 | 454 / 59 | 3,014,656 | 0.145 s | 0.44 MB | 11.4 ms |
+| 187 + 30 | 6,510 / 6,510 | 31.1 µs | 18,842 | 442 / 71 | 3,112,960 | 0.141 s | 0.44 MB | 10.9 ms |
+
+Each normal case used a 2,048-event capacity per stream and had no rejections; `integrity_check` returned `ok` and foreign-key checks returned zero violations. Callback p95 was 31–39 µs; the observed maximum varied from 0.15 to 4.12 ms under synthetic host scheduling and is not a real-time bound. In the blocked-writer burst, A rejected 136 samples and reached the configured high-water of 64; B accepted all 10 and reached a high-water of 10. A later sample was accepted after the write gate reopened. Final group status was partial and data completeness was false. These single-run timings are informational and do not establish hardware capture capacity.
+
 ## Remaining work and gate
 
-This pass does not add the Grouped Recording UI, a shared lease for single-camera recording, stale-lease recovery, crash-tail classification, periodic durable counters, preview metrics, History grouping, Analysis overlays, media recording, or production migration. Those remain later work. Before live integration, first complete the user's physical CEL-013 Pass 1 validation, then review this synthetic coordinator. No data should be written to the active user database until a separately approved migration and ownership design exist.
+This pass does not add the Grouped Recording UI, a shared lease for single-camera recording, stale-lease recovery, crash-tail classification, periodic durable counters, preview metrics, History grouping, Analysis overlays, media recording, or production migration. The schema-v3 grouped lease protects grouped coordinators, but the existing v2 `ExperimentRecorder` does not participate; the synthetic harness’s private temporary DB is the only supported adapter use. Before production activation, a later reviewed stage must define one ownership policy shared by both recorders, a separately approved real-database migration, asynchronous GUI lifecycle control, and crash/recovery behavior. User-reported Pass 1 validation is not evidence for grouped persistence, hardware synchronization, native V4L2 timestamps, or PS3 Eye 187 FPS dual capture.

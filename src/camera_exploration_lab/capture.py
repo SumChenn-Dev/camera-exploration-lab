@@ -89,6 +89,28 @@ class CaptureTimingEvent:
     capture_fps: float = 0.0
 
 
+class CaptureTimingSubscription:
+    """Exclusive, removable subscription to one worker's scalar timing events.
+
+    The worker retains one callback slot for backwards compatibility with the
+    single-camera recorder. A subscription owns that same slot until closed,
+    so a second recorder cannot silently replace or share the callback.
+    """
+
+    def __init__(self, worker: "OpenCVCaptureWorker", token: object) -> None:
+        self._worker = worker
+        self._token = token
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            self._closed = True
+        return self._worker._remove_timing_subscription(self._token)
+
+
 class LatestFrameBuffer:
     """A one-frame overwrite slot; readers may skip frames without blocking."""
 
@@ -222,6 +244,7 @@ class OpenCVCaptureWorker(threading.Thread):
         self._snapshot_lock = threading.Lock()
         self._listener_lock = threading.Lock()
         self._timing_listener: Callable[[CaptureTimingEvent], None] | None = None
+        self._timing_subscription_token: object | None = None
         self._snapshot = CaptureSnapshot(
             state=CaptureState.STARTING,
             requested=mode,
@@ -242,9 +265,38 @@ class OpenCVCaptureWorker(threading.Thread):
         self,
         listener: Callable[[CaptureTimingEvent], None] | None,
     ) -> None:
-        """Attach a non-blocking timing sink while leaving preview handoff alone."""
+        """Set the legacy single-camera timing sink.
+
+        New integrations should use ``subscribe_timing_listener`` so their
+        callback can only clear the listener slot it owns.
+        """
         with self._listener_lock:
+            if self._timing_subscription_token is not None:
+                raise RuntimeError("the capture timing listener is owned by an active subscription")
             self._timing_listener = listener
+
+    def subscribe_timing_listener(
+        self,
+        listener: Callable[[CaptureTimingEvent], None],
+    ) -> CaptureTimingSubscription:
+        """Claim the worker's single timing callback slot with an owned token."""
+        if not callable(listener):
+            raise TypeError("timing listener must be callable")
+        token = object()
+        with self._listener_lock:
+            if self._timing_listener is not None:
+                raise RuntimeError("this capture worker already has a timing listener")
+            self._timing_listener = listener
+            self._timing_subscription_token = token
+        return CaptureTimingSubscription(self, token)
+
+    def _remove_timing_subscription(self, token: object) -> bool:
+        with self._listener_lock:
+            if token is not self._timing_subscription_token:
+                return False
+            self._timing_listener = None
+            self._timing_subscription_token = None
+            return True
 
     def _emit_timing(self, kind: str, monotonic_ns: int, *, interval_ns: int | None = None,
                      capture_fps: float = 0.0) -> None:

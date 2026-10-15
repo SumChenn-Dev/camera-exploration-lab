@@ -150,6 +150,32 @@ class OpenCVCaptureWorkerTests(unittest.TestCase):
         self.assertIsNotNone(arrivals[1].interval_ns)
         self.assertGreater(arrivals[1].capture_fps, 0)
 
+    def test_owned_timing_subscription_is_exclusive_and_removes_only_its_listener(self) -> None:
+        worker = OpenCVCaptureWorker(
+            "/dev/synthetic-video", CaptureMode("synthetic", 320, 240, 30),
+            capture_factory=lambda _device: FakeCapture(),
+        )
+        events: list[CaptureTimingEvent] = []
+        subscription = worker.subscribe_timing_listener(events.append)
+        with self.assertRaises(RuntimeError):
+            worker.set_timing_listener(None)
+        with self.assertRaises(RuntimeError):
+            worker.subscribe_timing_listener(events.append)
+
+        worker._emit_timing("frame_arrival", 123_000_000)
+        self.assertEqual(len(events), 1)
+        self.assertTrue(subscription.close())
+        self.assertFalse(subscription.close())
+        worker._emit_timing("frame_arrival", 124_000_000)
+        self.assertEqual(len(events), 1)
+
+        # The legacy single-camera setter remains available after the owned
+        # adapter has released its callback slot.
+        worker.set_timing_listener(events.append)
+        worker._emit_timing("read_failure", 125_000_000)
+        worker.set_timing_listener(None)
+        self.assertEqual([event.kind for event in events], ["frame_arrival", "read_failure"])
+
     def test_capture_runs_ahead_of_the_single_preview_slot_and_reports_readback(self) -> None:
         # Driver readback deliberately differs from the request.
         properties = {

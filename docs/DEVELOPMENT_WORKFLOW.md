@@ -84,6 +84,16 @@ git push origin main
 
 Never force-push or rewrite the original private development history. If the remote has advanced, stop and review or integrate its changes before publishing.
 
+## CEL-013 Pass 2B.2: synthetic capture-adapter check
+
+This developer-only harness exercises capture-timing callbacks through the grouped coordinator without accessing cameras. It creates fresh synthetic schema-v3 databases under temporary directories, verifies integrity, and removes them on exit:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" tools/benchmark_capture_event_adapter.py --synthetic-only --seconds 30
+```
+
+The `--synthetic-only` acknowledgement is required. The tool accepts no database path, has no fallback to the app's database, and does not import OpenCV or enumerate devices. `--seconds 30` is simulated elapsed time; the harness runs faster than real time and its throughput figures are synthetic SQLite measurements. The grouped adapter is not wired into the desktop UI, and this command does not enable Record Both.
+
 ## CEL-013 Pass 1: physical dual-camera preview
 
 Run this check in a normal Bazzite KDE user session with the Sony PlayStation Eye and AVerMedia CAM 313 connected. Automated tests do not access the physical devices and this workflow does not change camera controls.

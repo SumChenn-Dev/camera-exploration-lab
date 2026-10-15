@@ -9,6 +9,18 @@ from typing import Any
 from uuid import uuid4
 
 
+SQLITE_INT_MAX = (1 << 63) - 1
+
+
+def _validate_optional_nonnegative_sqlite_integer(name: str, value: int | None) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer or None")
+    if value < 0 or value > SQLITE_INT_MAX:
+        raise ValueError(f"{name} is outside SQLite's nonnegative integer range")
+
+
 class BackendKind(StrEnum):
     V4L2 = "v4l2"
     CHDKPTP = "chdkptp"
@@ -114,6 +126,19 @@ class MeasurementSample:
     method: str | None = None
     raw_record_id: int | None = None
     id: str = field(default_factory=new_id)
+    # Schema v3 additions. These stay NULL for legacy/imported records and for
+    # OpenCV observations that do not expose a driver timestamp or sequence.
+    elapsed_ns: int | None = None
+    source_timestamp_ns: int | None = None
+    source_sequence: int | None = None
+    source_clock: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_optional_nonnegative_sqlite_integer("elapsed_ns", self.elapsed_ns)
+        _validate_optional_nonnegative_sqlite_integer("source_timestamp_ns", self.source_timestamp_ns)
+        _validate_optional_nonnegative_sqlite_integer("source_sequence", self.source_sequence)
+        if self.source_timestamp_ns is not None and not self.source_clock:
+            raise ValueError("source_clock is required when source_timestamp_ns is provided")
 
 
 @dataclass(slots=True, frozen=True)

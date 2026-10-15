@@ -327,28 +327,7 @@ class Database:
         return setting.id
 
     def record_measurement(self, sample: MeasurementSample) -> str:
-        scope = sample.stream_scope.value if hasattr(sample.stream_scope, "value") else str(sample.stream_scope)
-        with self.connect() as connection:
-            connection.execute(
-                """INSERT INTO measurements (
-                       id, benchmark_id, raw_record_id, metric, value, unit, stream_scope,
-                       observed_at, elapsed_seconds, sample_index, interval_ns, method
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    sample.id,
-                    sample.benchmark_id,
-                    sample.raw_record_id,
-                    sample.metric,
-                    sample.value,
-                    sample.unit,
-                    scope,
-                    sample.observed_at,
-                    sample.elapsed_seconds,
-                    sample.sample_index,
-                    sample.interval_ns,
-                    sample.method,
-                ),
-            )
+        self.record_measurements_batch([sample])
         return sample.id
 
     def begin_live_experiment(
@@ -536,15 +515,61 @@ class Database:
         """Insert one bounded batch of timing data in a single SQLite transaction."""
         if not samples:
             return 0
+        with self.connect() as connection:
+            return self._insert_measurements(connection, samples)
+
+    @staticmethod
+    def _insert_measurements(
+        connection: sqlite3.Connection,
+        samples: list[MeasurementSample] | tuple[MeasurementSample, ...],
+    ) -> int:
+        """Insert samples using the columns supported by this DB transaction."""
+        if not samples:
+            return 0
+        available_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(measurements)")
+        }
+        provenance_columns = {
+            "elapsed_ns", "source_timestamp_ns", "source_sequence", "source_clock"
+        }
+        present_provenance = provenance_columns & available_columns
+        if present_provenance and present_provenance != provenance_columns:
+            raise RuntimeError("measurement timing-provenance schema is incomplete")
+        has_v3_provenance = present_provenance == provenance_columns
         values = []
         for sample in samples:
             scope = sample.stream_scope.value if hasattr(sample.stream_scope, "value") else str(sample.stream_scope)
-            values.append((
+            if not has_v3_provenance and any((
+                sample.elapsed_ns is not None,
+                sample.source_timestamp_ns is not None,
+                sample.source_sequence is not None,
+                sample.source_clock is not None,
+            )):
+                raise RuntimeError("timing provenance fields require the grouped schema")
+            elapsed_seconds = sample.elapsed_seconds
+            if elapsed_seconds is None and sample.elapsed_ns is not None:
+                elapsed_seconds = sample.elapsed_ns / 1_000_000_000
+            row = (
                 sample.id, sample.benchmark_id, sample.raw_record_id, sample.metric,
                 sample.value, sample.unit, scope, sample.observed_at,
-                sample.elapsed_seconds, sample.sample_index, sample.interval_ns, sample.method,
-            ))
-        with self.connect() as connection:
+                elapsed_seconds, sample.sample_index, sample.interval_ns, sample.method,
+            )
+            if has_v3_provenance:
+                row += (
+                    sample.elapsed_ns, sample.source_timestamp_ns,
+                    sample.source_sequence, sample.source_clock,
+                )
+            values.append(row)
+        if has_v3_provenance:
+            connection.executemany(
+                """INSERT INTO measurements (
+                       id, benchmark_id, raw_record_id, metric, value, unit, stream_scope,
+                       observed_at, elapsed_seconds, sample_index, interval_ns, method,
+                       elapsed_ns, source_timestamp_ns, source_sequence, source_clock
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+        else:
             connection.executemany(
                 """INSERT INTO measurements (
                        id, benchmark_id, raw_record_id, metric, value, unit, stream_scope,

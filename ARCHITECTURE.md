@@ -30,7 +30,7 @@ Specialized computer-vision experiments should be optional extensions. An extens
 | Area | Choice | Status |
 | --- | --- | --- |
 | Data models, CSV, logs, CLI | Python standard library | Implemented |
-| Storage | Python `sqlite3` | Implemented; schema version 2 adds summaries and indexes |
+| Storage | Python `sqlite3` | Schema v2 is active; v3 grouped schema is synthetic-test-only and not enabled at startup |
 | V4L2 discovery | sysfs identity plus read-only `VIDIOC_QUERYCAP` | Implemented; image-capture nodes only |
 | Capture-mode enumeration | read-only `VIDIOC_ENUM_FMT`, `VIDIOC_ENUM_FRAMESIZES`, and `VIDIOC_ENUM_FRAMEINTERVALS` | Implemented in Multi-Camera; only reported discrete options and range endpoints are offered |
 | Desktop | PySide6 | Optional `desktop` extra; Live Workbench, History, and Analysis implemented |
@@ -76,6 +76,14 @@ Neither the duration of `read()` nor the time between host-side frame returns es
 - `import_sources` stores source path, SHA-256, file size, import time, and row counts. `(source_path, sha256)` prevents duplicate imports while allowing changed source contents to be imported as a new version.
 
 Schema version 2 adds the summary table and indexes without rewriting earlier imported rows. A version 1 database is upgraded on initialization. Stale live experiments are recovered as interrupted on startup; after a crash, their duration is bounded by the last committed timing sample because the exact stop time is unavailable.
+
+### CEL-013 Pass 2A grouped schema foundation
+
+Pass 2A adds an explicitly invoked, synthetic-only schema-v3 migration and grouped-session repository. The production application remains on SCHEMA_VERSION = 2: ordinary initialization does not call the v3 migration, and it continues to reject a database newer than v2. The v3 entry point requires a marked synthetic test database and is not exposed through the GUI or CLI. No real user database has been migrated.
+
+The grouped model reuses sessions as one experiment parent and gives it two benchmark_runs, mapped to camera streams A and B through benchmark_streams. Grouped membership is explicit; legacy single-camera and imported sessions remain unchanged and retain their existing sessions.camera_id meaning. Stream-level provenance includes host monotonic elapsed nanoseconds, timestamp source/clock/collection point, timing method, identity snapshot, independent run/settings/summary, and distinct read-failure, queue-loss, persistence-loss, detected sample-sequence-gap and preview-skip counters. Sequence gaps mark the dataset incomplete but do not prove camera or sensor drops. OpenCV driver timestamp fields remain NULL unless actually provided by a future backend.
+
+The future coordinator contract is nonblocking and bounded: every rejected queue sample increments a stream-local loss counter, later enqueue attempts continue when capacity returns, sequence gaps remain visible, and any lost timing sample makes the dataset incomplete. Queue gaps are persistence loss, not evidence of sensor or driver dropped frames. The repository schema and API do not yet connect to capture workers, add recording UI, enable a writer lease end-to-end, or save media. See [Grouped Recording Schema](docs/GROUPED_RECORDING_SCHEMA.md).
 
 The local database can contain camera serial numbers, machine-specific source paths, experiment names, and notes. It is user data and must not be committed or shared without review. New local databases default to the XDG data directory. Source CSV files are read in place; the importer checks that a file's content hash is stable during import and commits one source atomically.
 

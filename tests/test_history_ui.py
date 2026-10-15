@@ -111,6 +111,17 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
         self.application.processEvents()
         return predicate()
 
+    def test_multi_camera_tab_preserves_single_workbench_history_and_analysis(self) -> None:
+        window = LiveWorkbenchWindow(SyntheticDiscovery(), self.database)
+        self._windows.append(window)
+        labels = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+        self.assertEqual(
+            labels,
+            ["Live Workbench", "Multi-Camera", "History", "Analysis", "Exports"],
+        )
+        self.assertIsNotNone(window.multi_camera_workspace)
+        self.assertEqual(window.history_workspace.database, self.database)
+
     def test_recording_status_reports_missing_name_when_preview_is_ready(self) -> None:
         window = LiveWorkbenchWindow(
             SyntheticDiscovery(), self.database,

@@ -32,12 +32,14 @@ class FakeCapture:
         self.reads = list(reads) if reads is not None else [(True, SyntheticFrame())]
         self.delay = delay
         self.released = False
+        self.set_calls: list[tuple[int, float]] = []
         self._read_index = 0
 
     def isOpened(self) -> bool:
         return self.opened
 
     def set(self, prop: int, value: float) -> bool:
+        self.set_calls.append((prop, value))
         return True
 
     def get(self, prop: int) -> float:
@@ -185,6 +187,45 @@ class OpenCVCaptureWorkerTests(unittest.TestCase):
         self.assertEqual(worker.snapshot().state, CaptureState.STOPPED)
         self.assertEqual(worker.snapshot().capture_fps, 0.0)
         self.assertIsNone(worker.snapshot().frame_interval_ms)
+
+    def test_driver_default_mode_does_not_claim_or_set_a_requested_rate(self) -> None:
+        fake = FakeCapture(delay=0.001)
+        worker = OpenCVCaptureWorker(
+            "/dev/video7", CaptureMode("default", 640, 480, None, "MJPG"),
+            capture_factory=lambda _device: fake,
+        )
+        worker.start()
+        self.assertTrue(wait_until(lambda: worker.snapshot().state == CaptureState.RUNNING))
+        worker.request_stop()
+        worker.join(timeout=1)
+        self.assertTrue(worker.is_alive() is False)
+        # OpenCV property 5 is FPS; other mode requests remain independent.
+        self.assertNotIn(5, [prop for prop, _value in fake.set_calls])
+
+    def test_stop_requested_during_slow_initialization_finishes_as_stopped(self) -> None:
+        import threading
+
+        entered = threading.Event()
+        release_startup = threading.Event()
+        fake = FakeCapture(delay=0.001)
+
+        def slow_factory(_device: str) -> FakeCapture:
+            entered.set()
+            release_startup.wait(timeout=1)
+            return fake
+
+        worker = OpenCVCaptureWorker(
+            "/dev/video7", CaptureMode("slow-open", 320, 240, 60),
+            capture_factory=slow_factory,
+        )
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1))
+        worker.request_stop()
+        release_startup.set()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(worker.snapshot().state, CaptureState.STOPPED)
+        self.assertTrue(fake.released)
 
     def test_failed_initialization_is_reported_and_released(self) -> None:
         fake = FakeCapture(opened=False)

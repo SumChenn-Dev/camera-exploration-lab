@@ -79,3 +79,13 @@ Manual interruption, physical disconnect/reconnect, and restart persistence need
 - Added labeled Fit to Data, Reset View, Zoom In/Out, drag-to-pan, and Expand Plot/Restore Layout controls. The two main plots stack below 1120 px and remain inside a vertically scrolling workspace without horizontal page scrolling.
 - Extended palette-aware contrast to metadata, completion notes, disabled comparison controls, graph labels, and legends. No schema, recording, camera, or database behavior changed.
 - Verification: 90 camera-free tests pass; Python sources parse, dependency integrity and Git checks pass, and the release-ready privacy audit passes. A source-only wheel builds with system Python; the application virtual environment lacks setuptools for an in-environment wheel build. Physical GUI review remains a manual acceptance step.
+
+
+## CEL-013 Pass 1 — Dual-camera live workbench
+
+- Added a Multi-Camera tab alongside the existing Single Camera Workbench, History, Analysis, and Exports tabs.
+- Reused the existing OpenCV worker class twice. Each slot owns its device selection, enumerated mode, capture lifecycle, latest-frame buffer, preview FPS, capture FPS, frame count, read failures, negotiated settings, and host elapsed time.
+- Added read-only per-endpoint V4L2 format, frame-size, and frame-interval enumeration. The UI offers only reported mode combinations; unreported FPS is shown as driver-default rather than guessed. Existing single-camera tested presets remain available.
+- Added Start A/B, Stop A/B, Start Both, Stop Both, duplicate-endpoint protection across symlink aliases, adaptive side-by-side/stacked previews, and partial-start/disconnect status.
+- Fixed stop-during-initialization state handling so a late successful open cannot overwrite a pending stop. No camera controls are written, no schema changes are made, and dual experiment recording is explicitly deferred to Pass 2.
+- Automated verification uses mocked cameras and synthetic V4L2 ioctl responses; no physical capture is claimed. The full suite result and release audit are recorded after final canonical-checkout verification.

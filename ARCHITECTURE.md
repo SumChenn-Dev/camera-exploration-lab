@@ -4,7 +4,8 @@
 
 ```text
 PySide6 desktop shell
-    ├── Live Workbench (preview + persistent performance panel)
+    ├── Live Workbench (single-camera preview, recording, and persistent performance panel)
+    ├── Multi-Camera (two independent live V4L2 capture slots; Pass 1)
     ├── History (experiments and imported measurements)
     ├── Analysis (read-only timing analysis and two-run comparison)
     ├── Exports (future tab)
@@ -20,7 +21,7 @@ PySide6 desktop shell
           └── SQLite repository and CSV importer
 ```
 
-The core owns camera discovery, capture and preview, experiment metadata and timing, and local history. The first device backends are native V4L2 cameras: the Sony PlayStation Eye and AVerMedia Live Streamer CAM 313 have tested mode profiles. Canon CHDKPTP integration remains future work behind the backend boundary.
+The core owns camera discovery, capture and preview, experiment metadata and timing, and local history. The first device backends are native V4L2 cameras. The single-camera Workbench retains known tested presets; the Multi-Camera workspace enumerates each selected device's reported modes before offering them. Canon CHDKPTP integration remains future work behind the backend boundary.
 
 Specialized computer-vision experiments should be optional extensions. An extension may receive frames through its own bounded processing stage and emit metrics with the `processing` stream scope. It must not block the camera-owning thread or Qt event loop, and its packages, models, and algorithm-specific controls must stay outside the core dependency set. Wardrobe inventory is a separate application, not a Camera Exploration Lab module.
 
@@ -31,6 +32,7 @@ Specialized computer-vision experiments should be optional extensions. An extens
 | Data models, CSV, logs, CLI | Python standard library | Implemented |
 | Storage | Python `sqlite3` | Implemented; schema version 2 adds summaries and indexes |
 | V4L2 discovery | sysfs identity plus read-only `VIDIOC_QUERYCAP` | Implemented; image-capture nodes only |
+| Capture-mode enumeration | read-only `VIDIOC_ENUM_FMT`, `VIDIOC_ENUM_FRAMESIZES`, and `VIDIOC_ENUM_FRAMEINTERVALS` | Implemented in Multi-Camera; only reported discrete options and range endpoints are offered |
 | Desktop | PySide6 | Optional `desktop` extra; Live Workbench, History, and Analysis implemented |
 | Graphs | PyQtGraph | Optional `desktop` extra; interval/FPS plots and interval-distribution comparison implemented |
 | Frame capture and processing | NumPy + `opencv-python-headless` | Optional `desktop` extra; V4L2 capture worker implemented |
@@ -47,6 +49,14 @@ The camera model supports `v4l2`, `chdkptp`, and `unknown` backends. A future CH
 ## Capture, preview, and measurement ownership
 
 The camera-owning OpenCV worker runs on a dedicated thread. It overwrites a one-frame latest-frame slot for preview, so a slow UI skips stale display frames instead of building a frame queue. A high capture rate therefore does not require the UI to render at that rate. Preview FPS is calculated from frames rendered by the UI; capture FPS is calculated from successful `VideoCapture.read()` returns. Future image-processing stages report their own FPS.
+
+The Multi-Camera workspace composes two instances of the same `OpenCVCaptureWorker` used by the single-camera workbench; it does not create a second capture engine. Each instance owns one V4L2/OpenCV handle, capture clock, read-failure count, requested mode, negotiated readback, and one-frame latest buffer. The Qt workspace polls both snapshots on its GUI timer and converts at most one latest frame per slot per update. New captures overwrite stale preview frames; the UI never queues every captured frame. OpenCV format decode occurs inside each independent worker's `read()`; GUI image conversion and scaling occur on the GUI thread after bounded handoff.
+
+Device choices are based on effective capture capabilities and read-only V4L2 format, frame-size, and frame-interval enumeration. Numeric FPS choices come from intervals reported by the selected endpoint; if the driver reports a continuous or stepwise interval range, only the advertised boundary rates are offered. If no rate is reported, the UI can request driver-default FPS without asserting a numeric request. A mode is a request, and OpenCV driver readback plus observed host throughput remain separate. Known-camera labels only influence default selection among modes the endpoint reported. Endpoint duplication is checked using the real path behind the selected by-id alias with the current node as fallback, so different symlink names for the same node cannot be selected together.
+
+Each live slot has independent Start/Stop controls and metrics. Start Both returns after spawning both worker threads, then waits for each thread's running or failed state before reporting full or partial success. A failure or disconnect in one stream does not stop the other. Recovery is deliberate: refresh discovery and press Start again. No automatic reconnect or USB reset is attempted. The slot splitter is horizontal when wide and stacks vertically on narrower windows. Pass 1 is live preview only; it does not record paired experiments or change the SQLite schema.
+
+The streams may be requested together, but they are not hardware synchronized. Their host arrival timestamps are generated independently after each OpenCV read returns; a shared Start Both button does not align sensor exposure. Capture FPS measures successful returns in each worker, preview FPS measures frames converted/presented by each GUI pane, frame count counts successful returns in that worker, and read failures count unsuccessful reads. Elapsed capture time begins when the selected driver configuration has been read back. None of these is a sensor timestamp or absolute latency measurement.
 
 The experiment recorder receives timestamp-only events through a bounded queue of at most 8,192 items. A dedicated writer stores measurements in batches of at most 128 rows. Frame objects are not sent to that queue. If the timing queue fills, recording is interrupted while camera capture continues. Manual stop, duration completion, capture loss, application shutdown, and database errors have explicit statuses and termination reasons.
 

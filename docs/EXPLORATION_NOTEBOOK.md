@@ -45,7 +45,7 @@ The original private development history contains three completed milestones. Th
 | ID | Idea | Area | Status | Next evidence needed |
 | --- | --- | --- | --- | --- |
 | CEL-001 | Harden recording across manual stop, disconnect/reconnect, and restart recovery. | Core | Implemented; more physical cases pending | Compare visible status with persisted session state for each case. |
-| CEL-013 | Build the Multi-Camera Workbench and record concurrent experiments with per-camera timing and failure state. | Core (future) | Immediate next major functional milestone | Validate independent stream delivery, per-camera configuration, host-arrival timing, and interruption behavior; do not imply hardware synchronization. |
+| CEL-013 | Build the Multi-Camera Workbench and record concurrent experiments with per-camera timing and failure state. | Core | Pass 1 dual live preview implemented in this branch; Pass 2 paired recording is the next major milestone | Validate independent stream delivery, per-camera configuration, host-arrival timing, and later paired interruption behavior; do not imply hardware synchronization. |
 | CEL-002 | Add graphs, comparisons, and annotated exports. | Core | Analysis and comparison implemented in Phase 2B; exports planned | Visually review saved and imported runs on Bazzite; later define exports that preserve raw timestamps and units. |
 | CEL-003 | Add capability-driven exposure and gain controls with readback. | Core | Planned | Probe supported ranges and verify safe failure and restart behavior per device. |
 | CEL-004 | Compare camera modes and controlled environmental conditions. | Research | Proposed | Repeat runs with recorded lighting, exposure, focus, and lens position. |
@@ -161,3 +161,13 @@ Update an existing `CEL-###` item when possible. Mark proposed work clearly, pre
 - Evidence: PyQtGraph 0.14.0 `PlotItem.clear()` leaves ViewBox manual ranges intact and retains its legend object reference after detaching that legend from the ViewBox.
 - Decision: calculate each session's percentage deviation explicitly against its own mean; rebuild the legend after clearing; reset the view after relevant data/mode changes; keep manual navigation until reset or a relevant redraw.
 - Interpretation boundary: experiments are aligned to their own recorded elapsed clocks and remain independent recordings. No synchronization or sensor latency is inferred.
+
+
+### 2026-10-15 — CEL-013 Pass 1 dual live preview
+
+- Kind: decision and implementation
+- Context: extend the single-camera application to show two native V4L2 streams while preserving its recording, History, Analysis, and database behavior.
+- Finding or choice: compose two instances of the existing capture worker in a separate Multi-Camera tab. Each worker owns its stream and bounded latest-frame buffer; GUI preview cadence is independent. Enumerate the selected endpoint's formats, sizes, and advertised interval rates read-only before presenting choices. Use effective V4L2 capture capabilities and canonicalized endpoint paths to prevent opening the same endpoint twice.
+- Evidence: synthetic dual-worker, failure, selection, and UI tests. This sandbox did not access physical cameras.
+- Interpretation boundary: simultaneous user start does not synchronize camera sensors. Capture FPS, per-pane preview FPS, read failures, and host elapsed time remain separate; no paired experiment is recorded in Pass 1.
+- Follow-up: owner-supervised Bazzite test with the PS3 Eye and CAM 313; then design CEL-013 Pass 2 recording and database provenance without changing existing experiment rows.

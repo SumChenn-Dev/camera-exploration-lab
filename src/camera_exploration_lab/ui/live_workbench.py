@@ -37,6 +37,8 @@ from ..models import CameraCandidate, utc_now_iso
 from ..recording import ExperimentRecorder, RecordingSnapshot, RecordingState
 from .analysis_workspace import AnalysisWorkspace
 from .history_workspace import HistoryWorkspace
+from .multi_camera_workbench import MultiCameraWorkspace
+from .preview import frame_to_image
 
 logger = logging.getLogger(__name__)
 
@@ -69,38 +71,6 @@ def _mode_for_combo(combo: QComboBox) -> CaptureMode | None:
 def _candidate_for_combo(combo: QComboBox) -> CameraCandidate | None:
     candidate = combo.currentData(Qt.ItemDataRole.UserRole)
     return candidate if isinstance(candidate, CameraCandidate) else None
-
-
-def _frame_to_image(frame: Any) -> QImage:
-    """Wrap an OpenCV frame and copy its pixels before the buffer is reused."""
-    shape = getattr(frame, "shape", None)
-    if shape is None or len(shape) < 2:
-        raise ValueError("Camera returned a frame without image dimensions")
-    height, width = int(shape[0]), int(shape[1])
-    if height < 1 or width < 1:
-        raise ValueError("Camera returned an empty frame")
-
-    flags = getattr(frame, "flags", None)
-    if flags is not None and not flags.c_contiguous:
-        frame = frame.copy()
-    data = frame.data
-    strides = getattr(frame, "strides", None)
-    bytes_per_line = int(strides[0]) if strides else width * (int(shape[2]) if len(shape) > 2 else 1)
-
-    if len(shape) == 2:
-        image_format = QImage.Format.Format_Grayscale8
-    else:
-        channels = int(shape[2])
-        if channels == 3:
-            image_format = QImage.Format.Format_BGR888
-        elif channels == 4:
-            image_format = QImage.Format.Format_BGRA8888
-        else:
-            raise ValueError(f"Unsupported camera frame with {channels} channels")
-    image = QImage(data, width, height, bytes_per_line, image_format)
-    if image.isNull():
-        raise ValueError("Could not convert the camera frame for preview")
-    return image.copy()
 
 
 class MetricCard(QFrame):
@@ -157,6 +127,10 @@ class LiveWorkbenchWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self.tabs.addTab(self._build_live_tab(), "Live Workbench")
+        self.multi_camera_workspace = MultiCameraWorkspace(
+            refresh_requested=self.refresh_cameras, capture_factory=self._capture_factory
+        )
+        self.tabs.addTab(self.multi_camera_workspace, "Multi-Camera")
         self.history_workspace = HistoryWorkspace(self._database)
         self.history_workspace.analyze_requested.connect(self._open_history_in_analysis)
         self.history_table = self.history_workspace.history_table
@@ -390,9 +364,11 @@ class LiveWorkbenchWindow(QMainWindow):
         except Exception as exc:
             logger.exception("V4L2 discovery failed")
             self.top_status.setText(f"Camera discovery failed: {exc}")
+            self.multi_camera_workspace.discovery_failed(str(exc))
             return
 
         self._candidates = candidates
+        self.multi_camera_workspace.set_candidates(candidates)
         existing_ids = {candidate.identity.stable_identifier for candidate in candidates}
         if (self._active_stable_id and self._active_stable_id not in existing_ids
                 and self._worker and self._worker.is_alive()):
@@ -635,7 +611,7 @@ class LiveWorkbenchWindow(QMainWindow):
         if latest is not None:
             frame, self._last_frame_version, timestamp_ns = latest
             try:
-                self._last_image = _frame_to_image(frame)
+                self._last_image = frame_to_image(frame)
                 self._paint_preview()
                 self.preview_resolution.setText(f"{self._last_image.width()}×{self._last_image.height()}")
                 preview_ns = time.monotonic_ns()
@@ -765,6 +741,9 @@ class LiveWorkbenchWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override name
         self._poll_timer.stop()
         self._discovery_timer.stop()
+        unfinished = self.multi_camera_workspace.shutdown(timeout_seconds=0.75)
+        if unfinished:
+            logger.warning("Multi-camera workers still finishing during shutdown: %s", ", ".join(unfinished))
         self._finish_recording("application_shutdown")
         if self._worker and self._worker.is_alive():
             self._worker.request_stop()

@@ -75,6 +75,7 @@ class CaptureSnapshot:
     frame_count: int = 0
     read_failures: int = 0
     message: str = ""
+    elapsed_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,8 +210,9 @@ class OpenCVCaptureWorker(threading.Thread):
         capture_factory: CaptureFactory | None = None,
         frame_buffer: LatestFrameBuffer | None = None,
         read_failure_limit: int = 10,
+        worker_label: str | None = None,
     ) -> None:
-        super().__init__(name=f"celab-capture-{mode.name}", daemon=True)
+        super().__init__(name=f"celab-capture-{worker_label or mode.name}", daemon=True)
         self.device = device
         self.mode = mode
         self.frame_buffer = frame_buffer or LatestFrameBuffer()
@@ -269,6 +271,7 @@ class OpenCVCaptureWorker(threading.Thread):
 
     def run(self) -> None:
         capture: CaptureLike | None = None
+        capture_started_ns: int | None = None
         try:
             capture = self._capture_factory(self.device)
             if not capture.isOpened():
@@ -281,7 +284,8 @@ class OpenCVCaptureWorker(threading.Thread):
                 capture.set(_CAP_PROP_FOURCC, float(fourcc))
             capture.set(_CAP_PROP_FRAME_WIDTH, float(self.mode.width))
             capture.set(_CAP_PROP_FRAME_HEIGHT, float(self.mode.height))
-            capture.set(_CAP_PROP_FPS, float(self.mode.fps))
+            if self.mode.fps is not None:
+                capture.set(_CAP_PROP_FPS, float(self.mode.fps))
 
             negotiated = NegotiatedSettings(
                 width=_reported_int(capture.get(_CAP_PROP_FRAME_WIDTH)),
@@ -289,10 +293,15 @@ class OpenCVCaptureWorker(threading.Thread):
                 fps=_reported_fps(capture.get(_CAP_PROP_FPS)),
                 pixel_format=_fourcc_text(capture.get(_CAP_PROP_FOURCC)),
             )
+            if self._stop_event.is_set():
+                self._update(state=CaptureState.STOPPING, message="Stopped during camera initialization.")
+                return
+            capture_started_ns = time.monotonic_ns()
             self._update(
                 state=CaptureState.RUNNING,
                 negotiated=negotiated,
                 message="Capturing; driver readback is shown separately from the request.",
+                elapsed_seconds=0.0,
             )
 
             frame_rate = RollingFrameRate()
@@ -307,7 +316,10 @@ class OpenCVCaptureWorker(threading.Thread):
                     consecutive_failures += 1
                     current = self.snapshot()
                     total_failures = current.read_failures + 1
-                    self._update(read_failures=total_failures)
+                    self._update(
+                        read_failures=total_failures,
+                        elapsed_seconds=(captured_ns - capture_started_ns) / 1_000_000_000,
+                    )
                     self._emit_timing(
                         "read_failure", captured_ns, capture_fps=current.capture_fps
                     )
@@ -347,10 +359,14 @@ class OpenCVCaptureWorker(threading.Thread):
                         capture_fps=capture_fps,
                         frame_interval_ms=frame_interval_ms,
                         frame_count=frame_count,
+                        elapsed_seconds=(now_ns - capture_started_ns) / 1_000_000_000,
                     )
                     last_snapshot_ns = now_ns
                 else:
-                    self._update(frame_count=frame_count, frame_interval_ms=frame_interval_ms)
+                    self._update(
+                        frame_count=frame_count, frame_interval_ms=frame_interval_ms,
+                        elapsed_seconds=(now_ns - capture_started_ns) / 1_000_000_000,
+                    )
 
         except Exception as exc:
             if isinstance(exc, RuntimeError) and str(exc).startswith("OpenCV is not installed"):
@@ -361,6 +377,8 @@ class OpenCVCaptureWorker(threading.Thread):
             if current.state not in (CaptureState.STOPPING, CaptureState.STOPPED):
                 self._update(state=CaptureState.FAILED, message=f"Capture failed: {exc}")
         finally:
+            if capture_started_ns is not None:
+                self._update(elapsed_seconds=max(0.0, (time.monotonic_ns() - capture_started_ns) / 1_000_000_000))
             if capture is not None:
                 try:
                     capture.release()

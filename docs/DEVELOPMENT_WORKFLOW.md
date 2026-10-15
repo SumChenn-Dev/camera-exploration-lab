@@ -84,6 +84,30 @@ git push origin main
 
 Never force-push or rewrite the original private development history. If the remote has advanced, stop and review or integrate its changes before publishing.
 
+## CEL-013 Pass 1: physical dual-camera preview
+
+Run this check in a normal Bazzite KDE user session with the Sony PlayStation Eye and AVerMedia CAM 313 connected. Automated tests do not access the physical devices and this workflow does not change camera controls.
+
+```bash
+CHECKOUT="$HOME/Documents/Codex/Camera-Exploration-Lab-public-snapshot"
+VENV="$HOME/.local/share/camera-exploration-lab/venv"
+cd "$CHECKOUT"
+"$VENV/bin/celab" scan-v4l2
+```
+
+Launch from the existing KDE Camera Exploration Lab entry, or keep using its current database argument in Konsole:
+
+```bash
+LAUNCHER="$HOME/.local/share/applications/camera-exploration-lab.desktop"
+DATABASE="$(sed -n 's/.*--database "\([^"]*\)".*/\1/p' "$LAUNCHER")"
+test -n "$DATABASE"
+"$VENV/bin/celab" --database "$DATABASE" gui
+```
+
+Open **Multi-Camera**. Select the PlayStation Eye and CAM 313 in separate slots. The offered capture modes come from read-only format/size/frame-interval enumeration of each endpoint; choose a requested rate and check separate driver readback. Start A and B independently, stop one while confirming the other remains active, then use Start Both and Stop Both. Compare per-slot Capture FPS with Preview FPS; the GUI deliberately skips stale display frames. A partial-start message should retain the healthy stream. Reconnect testing requires a deliberate refresh and manual restart. A successful joint preview confirms concurrent host delivery only; it does not establish camera synchronization or sensor latency.
+
+Single-camera recording remains in Live Workbench. The Multi-Camera tab has no Record Both control in Pass 1. Grouped experiment storage, paired host-time analysis, and interruption recovery belong to CEL-013 Pass 2 and are not implemented here.
+
 ## Verified Bazzite runtime and existing data
 
 The Bazzite host transition is complete. The existing virtual environment's editable install resolves to the canonical public checkout, and the KDE launcher opens the app with the pre-existing local SQLite database. Both webcams were discovered and previewed; History still shows the earlier PS3 Eye 187 FPS experiment. The original checkout and database remain preserved.

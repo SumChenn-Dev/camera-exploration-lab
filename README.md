@@ -8,8 +8,9 @@ The current application includes:
 
 - Read-only V4L2 discovery with `/dev/v4l/by-id` identity preferred when available.
 - A preview-first Live Workbench for V4L2 cameras, with the preview occupying about two thirds of the primary area and persistent capture/preview diagnostics beside it.
-- Camera selection and tested mode profiles for the Sony PlayStation Eye and AVerMedia Live Streamer CAM 313.
-- Independent camera capture and GUI preview loops. Capture can run faster than the screen refresh without building a frame queue.
+- Camera selection and tested single-camera mode profiles for the Sony PlayStation Eye and AVerMedia Live Streamer CAM 313.
+- A separate Multi-Camera tab with two independent V4L2 workers, mode choices enumerated from each device, independent status and metrics, and side-by-side or stacked previews.
+- Independent camera capture and GUI preview loops. Each dual preview reads from a one-frame overwrite slot, so 187 FPS capture does not require 187 GUI updates or create an unbounded queue.
 - Fixed duration and manual experiment recording, with requested settings, driver readback, notes, timestamps, summary statistics, and raw timing samples stored in SQLite.
 - A searchable History tab for local experiment sessions and imported CSV measurements, with camera-family/source filters and stable Analyze-selected navigation.
 - An Analysis tab with camera/mode/requested-FPS filters, searchable Session A/B selection, summary cards, timing curves, interval distributions, and same-camera comparisons by default.
@@ -21,7 +22,7 @@ With two sessions selected, the Analysis tab overlays capture-FPS curves only wh
 
 Analysis distinguishes requested settings, driver readback, observed capture throughput, GUI preview cadence, and future processing throughput. Its FPS curve uses non-overlapping windows of recorded frame intervals (one second by default; longer windows for very long recordings). Imported or incomplete records may have summary-only values and are labeled accordingly. Frame-arrival timestamps are host observations after OpenCV returns; neither they nor frame intervals measure sensor exposure or sensor-to-display latency. Analysis opens SQLite read-only and does not change the local database. Raw video is not retained by the recorder.
 
-Exports, extensive camera controls, multi-camera recording, and Canon CHDKPTP support are future work. The core application is for camera research. Specialized computer-vision experiments will use optional extension packages with their own dependencies and processing metrics. Wardrobe inventory is a separate application and is outside this project.
+Multi-camera recording and its experiment/database model, exports, extensive camera controls, and Canon CHDKPTP support are future work. The core application is for camera research. Specialized computer-vision experiments will use optional extension packages with their own dependencies and processing metrics. Wardrobe inventory is a separate application and is outside this project.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the component boundaries and [docs/EXPLORATION_NOTEBOOK.md](docs/EXPLORATION_NOTEBOOK.md) for ongoing ideas, findings, and design decisions.
 The [development log](docs/DEVELOPMENT_LOG.md) summarizes completed milestones. See the [Konsole development workflow](docs/DEVELOPMENT_WORKFLOW.md) for tests, read-only release review, and deliberate GitHub publication. The [initial snapshot audit](docs/PUBLICATION_AUDIT.md) documents the separate one-time privacy check.
@@ -118,6 +119,12 @@ The importer reads the source files without moving or editing them. Reimporting 
 Launch Camera Exploration Lab through the KDE launcher, or use the existing virtual environment and the same database argument already configured in the launcher. History search covers experiment names, camera, source, notes, capture mode, requested FPS, date, and status where available. Camera-family and source filters can be combined; Clear filters resets them. Sorting and filtering do not edit stored records. Select a row and choose Analyze selected, or open Analysis and select a run directly. Choose a second run in Session B to see compatible elapsed-time curves, interval-distribution comparison, and the metric table.
 
 For host visual review, check the timeline units and displayed interval count against the selected run, compare capture and preview rates separately, and confirm that requested and driver-reported modes remain distinct. A raw interval plot may be unavailable for summary-only imports; those records show stored fields without reconstructing samples. History and Analysis use read-only connections for browsing and leave the existing history file in place. See [Related Projects](docs/RELATED_PROJECTS.md) for complementary tools and scope boundaries.
+
+## Multi-Camera live preview (CEL-013 Pass 1)
+
+The Multi-Camera tab supports two independent V4L2 live streams. It enumerates capture formats, sizes, and advertised frame intervals using read-only V4L2 ioctls; only reported options appear. The driver readback is shown separately from the request, and delivered capture FPS can be lower than the requested value. Each stream has its own start/stop controls, capture worker, latest-frame slot, preview rate, frame count, failures, and elapsed host time. Start Both waits for both streams to confirm independently and reports partial startup if only one succeeds.
+
+The two streams share one user action but are not hardware-synchronized. Host frame arrival does not establish sensor exposure timing or absolute latency. Preview rendering runs at the GUI refresh cadence and can skip captured frames. Pass 1 does not record grouped experiments; use Single Camera Workbench for recording. CEL-013 Pass 2 will define grouped timing provenance and persistence.
 
 ## Tests
 

@@ -243,6 +243,47 @@ class CaptureRecordingAdapterTests(unittest.TestCase):
         self.assertEqual(failures[0][0], run_a)
         self.assertEqual(record.streams[0].read_failure_count, 1)
 
+    def test_separate_capture_threads_submit_concurrently_with_independent_sequences(self) -> None:
+        coordinator = self.make_coordinator(queue_capacity=1024, batch_size=32)
+        bridge = self.make_bridge(coordinator)
+        worker_a, worker_b = FakeTimingWorker(), FakeTimingWorker()
+        bridge.start_recording({"A": worker_a, "B": worker_b})
+        epoch = self.clock.value
+        count = 250
+        start_gate = threading.Barrier(3)
+        failures: list[BaseException] = []
+
+        def emit_series(worker: FakeTimingWorker, offset_ns: int, step_ns: int) -> None:
+            try:
+                start_gate.wait(timeout=2)
+                for index in range(count):
+                    worker.emit_frame(epoch + offset_ns + index * step_ns)
+            except BaseException as exc:
+                failures.append(exc)
+
+        threads = (
+            threading.Thread(target=emit_series, args=(worker_a, 10, 50_000)),
+            threading.Thread(target=emit_series, args=(worker_b, 30, 80_000)),
+        )
+        for thread in threads:
+            thread.start()
+        start_gate.wait(timeout=2)
+        for thread in threads:
+            thread.join(timeout=2)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(failures, [])
+        self.assertTrue(coordinator.wait_for_committed("A", count, timeout=2))
+        self.assertTrue(coordinator.wait_for_committed("B", count, timeout=2))
+
+        record = bridge.stop_recording()
+        self.assertEqual(record.status, GroupStatus.PARTIAL)
+        rows = self.measurement_rows()
+        run_ids = {stream.slot: stream.benchmark_id for stream in record.streams}
+        for slot in ("A", "B"):
+            stream_rows = [row for row in rows if row[0] == run_ids[slot]]
+            self.assertEqual([row[1] for row in stream_rows], list(range(count)))
+        self.assertEqual(len(rows), count * 2)
+
     def test_stop_recording_leaves_preview_capture_running_and_rejects_stale_callback(self) -> None:
         coordinator = self.make_coordinator()
         bridge = self.make_bridge(coordinator)

@@ -17,7 +17,10 @@ from PySide6.QtWidgets import QApplication
 
 from camera_exploration_lab.capture import CaptureState
 from camera_exploration_lab.db import Database
-from camera_exploration_lab.capture_recording_adapter import GroupedRecordingPersistenceError
+from camera_exploration_lab.capture_recording_adapter import (
+    GroupedCaptureRecordingBridge,
+    GroupedRecordingPersistenceError,
+)
 from camera_exploration_lab.grouped_recording_coordinator import GroupedRecordingCoordinator
 from camera_exploration_lab.grouped_recording import GroupedExperimentRepository, RecordingLeaseBusyError
 from camera_exploration_lab.schema_migrations import SYNTHETIC_DATABASE_APPLICATION_ID
@@ -333,18 +336,73 @@ class SyntheticRecordingUiTests(unittest.TestCase):
         window.close()
         self.assertTrue(wait_until(lambda: window._close_complete))
 
-    def test_duration_target_reports_completed_only_after_committed_finalization(self) -> None:
+    def test_duration_target_auto_stops_sources_after_committed_finalization(self) -> None:
         window = self.make_window(auto_emit=True)
-        window.acknowledgement.setChecked(True)
-        window.start_both_button.click()
+        self.assertFalse(window.keep_capture_running_checkbox.isChecked())
+        self.acknowledge_and_start(window)
+        window.duration.setCurrentIndex(0)
+        window.record_both_button.click()
         self.assertTrue(wait_until(lambda: window._latest_view is not None
-                                   and all(item.capture_state == "running" for item in window._latest_view.streams)))
+                                   and window._latest_view.recording_state == "completed"
+                                   and all(item.capture_state == "stopped" for item in window._latest_view.streams), 4.0))
+        self.assertIn("finalized as completed", window.state_label.text().lower())
+        self.assertEqual(window._latest_view.writer_status, "Final transaction committed")
+        self.assertIn(
+            "Recording completed and saved. Both synthetic capture sources stopped automatically.",
+            window.capture_status_label.text(),
+        )
+        session_id = window._latest_view.session_id
+        self.assertIsNotNone(session_id)
+        persisted_at_finalization = tuple(stream.persisted_samples for stream in window._latest_view.streams)
+        frames_at_finalization = tuple(stream.frame_count for stream in window._latest_view.streams)
+        self.assertGreater(persisted_at_finalization[0], 0)
+        self.assertGreater(persisted_at_finalization[1], 0)
+        self.assertEqual(tuple(stream.simulated_capture_fps for stream in window._latest_view.streams), (0.0, 0.0))
+        self.assertTrue(all(source.snapshot().state is CaptureState.STOPPED for source in self.sources.values()))
+
+        database = window._worker._database
+        self.assertIsNotNone(database)
+        with database.connect_readonly() as connection:
+            self.assertEqual(connection.execute("PRAGMA query_only").fetchone()[0], 1)
+            persisted_rows = tuple(int(row[0]) for row in connection.execute(
+                """SELECT COUNT(*) FROM measurements m
+                   JOIN benchmark_streams bs ON bs.benchmark_id=m.benchmark_id
+                   WHERE bs.session_id=? AND m.metric='frame_arrival' AND m.stream_scope='capture'
+                   GROUP BY bs.slot ORDER BY bs.slot""",
+                (session_id,),
+            ).fetchall())
+        self.assertEqual(persisted_rows, persisted_at_finalization)
+        APP.processEvents()
+        self.assertEqual(
+            tuple(stream.frame_count for stream in window._latest_view.streams), frames_at_finalization,
+            "live event totals must remain fixed after both synthetic sources stop",
+        )
+        with database.connect_readonly() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM measurements WHERE metric='frame_arrival' AND stream_scope='capture'"
+            ).fetchone()[0], sum(persisted_at_finalization))
+
+        inspection_results = []
+        window._worker.action_finished.connect(
+            lambda action, result: inspection_results.append(result) if action == "inspect" else None
+        )
+        window.inspect_button.click()
+        self.assertTrue(wait_until(lambda: bool(inspection_results)))
+        inspected_counts = tuple(item["persisted_samples"] for item in inspection_results[-1]["streams"])
+        self.assertEqual(inspected_counts, persisted_at_finalization)
+        self.assertIn("Saved synthetic group", window.inspection_label.text())
+        self.assertIsNotNone(window._explorer_dialog, "grouped History/Analysis stays available after auto-stop")
+        window.close()
+        self.assertTrue(wait_until(lambda: window._close_complete))
+
+    def test_duration_target_keep_running_checkbox_preserves_capture_but_not_recording(self) -> None:
+        window = self.make_window(auto_emit=True)
+        window.keep_capture_running_checkbox.setChecked(True)
+        self.acknowledge_and_start(window)
         window.duration.setCurrentIndex(0)
         window.record_both_button.click()
         self.assertTrue(wait_until(lambda: window._latest_view is not None
                                    and window._latest_view.recording_state == "completed", timeout=4.0))
-        self.assertIn("finalization committed", window.state_label.text().lower())
-        self.assertEqual(window._latest_view.writer_status, "Final transaction committed")
         self.assertIn(
             "Recording completed and saved. Synthetic capture is still running; use Stop Both to stop the sources.",
             window.capture_status_label.text(),
@@ -353,7 +411,7 @@ class SyntheticRecordingUiTests(unittest.TestCase):
         frames_at_finalization = tuple(stream.frame_count for stream in window._latest_view.streams)
         self.assertGreater(persisted_at_finalization[0], 0)
         self.assertGreater(persisted_at_finalization[1], 0)
-        self.assertGreater(frames_at_finalization[0], frames_at_finalization[1])
+        self.assertTrue(all(source.snapshot().state is CaptureState.RUNNING for source in self.sources.values()))
         self.assertTrue(wait_until(lambda: all(
             stream.frame_count > frames_at_finalization[index]
             for index, stream in enumerate(window._latest_view.streams)
@@ -363,16 +421,56 @@ class SyntheticRecordingUiTests(unittest.TestCase):
             persisted_at_finalization,
             "finalized recording counters must stay fixed while live capture continues",
         )
-        inspection_results = []
-        window._worker.action_finished.connect(
-            lambda action, result: inspection_results.append(result) if action == "inspect" else None
+        database = window._worker._database
+        self.assertIsNotNone(database)
+        with database.connect_readonly() as connection:
+            row_count = int(connection.execute(
+                "SELECT COUNT(*) FROM measurements WHERE metric='frame_arrival' AND stream_scope='capture'"
+            ).fetchone()[0])
+        self.assertEqual(row_count, sum(persisted_at_finalization))
+        self.assertEqual(
+            tuple(stream.persisted_samples for stream in window._latest_view.streams),
+            persisted_at_finalization,
         )
         window.inspect_button.click()
-        self.assertTrue(wait_until(lambda: bool(inspection_results)))
-        inspected_counts = tuple(item["persisted_samples"] for item in inspection_results[-1]["streams"])
-        self.assertEqual(inspected_counts, persisted_at_finalization)
+        self.assertTrue(wait_until(lambda: "Saved synthetic group" in window.inspection_label.text()))
+        window.stop_both_button.click()
+        self.assertTrue(wait_until(lambda: all(
+            stream.capture_state == "stopped" for stream in window._latest_view.streams
+        )))
         window.close()
         self.assertTrue(wait_until(lambda: window._close_complete))
+
+    def test_close_during_natural_finalization_waits_for_ack_then_shuts_sources_down(self) -> None:
+        window = self.make_window(auto_emit=True)
+        self.acknowledge_and_start(window)
+        window.duration.setCurrentIndex(0)
+        entered = threading.Event()
+        release = threading.Event()
+        original = GroupedCaptureRecordingBridge.stop_recording
+
+        def gated_finalize(bridge, **kwargs):
+            entered.set()
+            if not release.wait(3.0):
+                raise TimeoutError("synthetic natural-finalization gate timed out")
+            return original(bridge, **kwargs)
+
+        with patch.object(
+            GroupedCaptureRecordingBridge, "stop_recording", autospec=True, side_effect=gated_finalize
+        ):
+            window.record_both_button.click()
+            self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                       and window._latest_view.recording_state.startswith("Recording")))
+            self.assertTrue(wait_until(entered.is_set, 3.0))
+            window.close()
+            self.assertFalse(window._close_complete)
+            release.set()
+            self.assertTrue(wait_until(lambda: window._close_complete, 4.0))
+        self.assertFalse(window._thread.isRunning())
+        self.assertIsNotNone(window._worker._final_record)
+        self.assertEqual(str(window._worker._final_record.status), "completed")
+        self.assertTrue(all(not (source._thread and source._thread.is_alive()) for source in self.sources.values()))
+        self.assertNotEqual(window._worker._auto_stop_result, "stopped")
 
     def test_high_rate_synthetic_profiles_run_independently(self) -> None:
         window = self.make_window(auto_emit=True)
@@ -449,6 +547,26 @@ class SyntheticRecordingUiTests(unittest.TestCase):
         window.close()
         self.assertTrue(wait_until(lambda: window._close_complete))
 
+    def test_natural_completion_after_source_failure_stops_sibling_but_keeps_partial_status(self) -> None:
+        window = self.make_window(auto_emit=True, fail_after_frames={"A": 12})
+        self.acknowledge_and_start(window)
+        window.duration.setCurrentIndex(0)
+        window.record_both_button.click()
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and window._latest_view.streams[0].capture_state == "failed"))
+        self.assertEqual(window._latest_view.streams[1].capture_state, "running")
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and not window._latest_view.automatic_capture_stop_pending
+                                   and window._latest_view.recording_state in {"partial", "failed"}
+                                   and window._latest_view.streams[1].capture_state == "stopped", 4.0))
+        self.assertNotEqual(window._latest_view.recording_state, "completed")
+        self.assertIn("finalized as", window.capture_status_label.text().lower())
+        self.assertIn("stopped automatically", window.capture_status_label.text().lower())
+        self.assertEqual(self.sources["A"].snapshot().state, CaptureState.FAILED)
+        self.assertEqual(self.sources["B"].snapshot().state, CaptureState.STOPPED)
+        window.close()
+        self.assertTrue(wait_until(lambda: window._close_complete))
+
     def test_close_during_startup_is_deferred_until_worker_teardown(self) -> None:
         window = self.make_window(auto_emit=True)
         window.acknowledgement.setChecked(True)
@@ -514,6 +632,8 @@ class SyntheticRecordingUiTests(unittest.TestCase):
             APP.processEvents()
             self.assertEqual(window.size().width(), width)
             self.assertEqual(window.size().height(), 768)
+            self.assertTrue(window.keep_capture_running_checkbox.isVisible())
+            self.assertGreater(window.keep_capture_running_checkbox.width(), 0)
             self.assertEqual(window.splitter.orientation(), Qt.Orientation.Horizontal)
             for panel in window._stream_panels:
                 scroll = panel.metrics_scroll_area
@@ -574,8 +694,8 @@ class SyntheticRecordingUiTests(unittest.TestCase):
     def test_duplicate_record_request_cannot_create_a_second_group(self) -> None:
         window = self.make_window()
         self.acknowledge_and_start(window)
-        window.request_record_both.emit(5.0)
-        window.request_record_both.emit(5.0)
+        window.request_record_both.emit(5.0, False)
+        window.request_record_both.emit(5.0, False)
         self.assertTrue(wait_until(lambda: window._latest_view is not None
                                    and window._latest_view.session_id is not None
                                    and window._latest_view.recording_state.startswith("Recording")))
@@ -737,6 +857,8 @@ class SyntheticRecordingUiTests(unittest.TestCase):
             self.assertTrue(wait_until(lambda: window._latest_view is not None
                                        and "unconfirmed" in window._latest_view.recording_state.lower()))
             self.assertNotEqual(window._latest_view.recording_state, "completed")
+            self.assertTrue(all(source.snapshot().state is CaptureState.RUNNING for source in self.sources.values()))
+            self.assertIn("not reported as saved", window.capture_status_label.text().lower())
             with patch("camera_exploration_lab.ui.synthetic_recording_harness.QMessageBox.warning"):
                 window.close()
                 self.assertTrue(wait_until(lambda: window._close_complete, 4.0))

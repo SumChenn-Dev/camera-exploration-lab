@@ -103,6 +103,7 @@ class SyntheticHarnessView:
     writer_status: str
     streams: tuple[SyntheticStreamView, SyntheticStreamView]
     last_error: str | None
+    automatic_capture_stop_pending: bool
 
 
 class _SyntheticSubscription:
@@ -242,12 +243,22 @@ class SyntheticCaptureSource:
         return _SyntheticSubscription(self, listener)
 
     def stop(self, timeout: float = 0.75) -> bool:
+        self.request_stop()
+        return self.wait_stopped(timeout)
+
+    def request_stop(self) -> None:
+        """Ask the producer to stop without waiting for its thread."""
         self._stop.set()
         with self._lock:
             thread = self._thread
             if self._state is not CaptureState.FAILED:
                 self._state = CaptureState.STOPPING
                 self._message = "Synthetic source stop requested."
+
+    def wait_stopped(self, timeout: float = 0.75) -> bool:
+        """Wait at most ``timeout`` for a previously requested stop."""
+        with self._lock:
+            thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(max(0.0, timeout))
         alive = bool(thread and thread.is_alive())
@@ -286,6 +297,11 @@ class _SyntheticRecordingWorker(QObject):
         self._session_id: str | None = None
         self._record_started_ns: int | None = None
         self._record_target_seconds: float | None = None
+        self._keep_capture_running_after_recording = False
+        self._auto_stop_pending = False
+        self._auto_stop_result: str | None = None
+        self._auto_stop_requested_at: float | None = None
+        self._auto_stop_warning_emitted = False
         self._final_elapsed_seconds = 0.0
         self._final_record: Any = None
         self._finalization_unconfirmed = False
@@ -315,6 +331,10 @@ class _SyntheticRecordingWorker(QObject):
             return
         self._operation = "Starting both synthetic streams"
         self._last_error = None
+        self._auto_stop_pending = False
+        self._auto_stop_result = None
+        self._auto_stop_requested_at = None
+        self._auto_stop_warning_emitted = False
         self._ended_slots.clear()
         try:
             self._sources = {
@@ -335,8 +355,8 @@ class _SyntheticRecordingWorker(QObject):
             self.action_failed.emit("start_both", self._last_error)
         self._publish_snapshot()
 
-    @Slot(float)
-    def start_recording(self, target_seconds: float) -> None:
+    @Slot(float, bool)
+    def start_recording(self, target_seconds: float, keep_capture_running: bool = False) -> None:
         if self._shutdown_requested.is_set():
             self.action_failed.emit("record_both", "Window shutdown has already been requested.")
             return
@@ -353,6 +373,11 @@ class _SyntheticRecordingWorker(QObject):
         self._session_id = None
         self._record_started_ns = None
         self._record_target_seconds = None
+        self._keep_capture_running_after_recording = bool(keep_capture_running)
+        self._auto_stop_pending = False
+        self._auto_stop_result = None
+        self._auto_stop_requested_at = None
+        self._auto_stop_warning_emitted = False
         self._final_elapsed_seconds = 0.0
         self._final_record = None
         self._finalization_unconfirmed = False
@@ -454,6 +479,11 @@ class _SyntheticRecordingWorker(QObject):
     @Slot()
     def stop_both(self) -> None:
         self._operation = "Stop Both requested"
+        # A user Stop Both request takes ownership of shutdown if natural
+        # completion has already requested automatic source termination.
+        self._auto_stop_pending = False
+        self._auto_stop_result = None
+        self._auto_stop_requested_at = None
         state = self._bridge.snapshot()[0] if self._bridge is not None else None
         finalized = True
         if state is BridgeState.RECORDING:
@@ -552,6 +582,9 @@ class _SyntheticRecordingWorker(QObject):
         self._try_shutdown()
 
     def _try_shutdown(self) -> None:
+        self._auto_stop_pending = False
+        self._auto_stop_result = None
+        self._auto_stop_requested_at = None
         if self._bridge is not None:
             try:
                 state, _adapters = self._bridge.snapshot()
@@ -731,13 +764,89 @@ class _SyntheticRecordingWorker(QObject):
                     self._ended_slots.add(slot)
         if self._shutdown_requested.is_set():
             self._try_shutdown()
-        elif self._bridge is not None and self._bridge.snapshot()[0] is BridgeState.RECORDING:
+        else:
+            if self._auto_stop_pending:
+                self._poll_automatic_source_stop()
+        if not self._shutdown_requested.is_set() and self._bridge is not None and self._bridge.snapshot()[0] is BridgeState.RECORDING:
             target = self._record_target_seconds
             if target is not None and self._record_started_ns is not None:
                 elapsed = (time.monotonic_ns() - self._record_started_ns) / 1_000_000_000
                 if elapsed >= target:
-                    self._finish_recording("requested_duration_elapsed", "Requested synthetic duration reached")
+                    finalized = self._finish_recording(
+                        "requested_duration_elapsed", "Requested synthetic duration reached"
+                    )
+                    if (
+                        finalized
+                        and not self._keep_capture_running_after_recording
+                        and not self._shutdown_requested.is_set()
+                    ):
+                        self._request_automatic_source_stop()
         self._publish_snapshot()
+
+    def _request_automatic_source_stop(self) -> None:
+        """Stop fake producers only after the coordinator acknowledges finalization."""
+        if self._bridge is None or self._final_record is None:
+            return
+        if self._bridge.snapshot()[0] is not BridgeState.FINALIZED:
+            return
+        self._auto_stop_pending = True
+        self._auto_stop_requested_at = time.monotonic()
+        self._auto_stop_warning_emitted = False
+        self._auto_stop_result = "pending"
+        self._operation = "Recording finalized; waiting for synthetic capture shutdown"
+        try:
+            # Request both stops before polling either producer, so their
+            # termination proceeds concurrently and no sample can follow the
+            # finalized experiment through an attached adapter.
+            for source in self._sources.values():
+                source.request_stop()
+        except Exception as exc:
+            self._auto_stop_pending = False
+            self._auto_stop_result = "failed"
+            self._last_error = self._safe_error(exc)
+            self._operation = "Recording finalized, but automatic capture stop failed"
+            self.action_failed.emit("auto_stop", self._last_error)
+            self._publish_snapshot()
+
+    def _poll_automatic_source_stop(self) -> None:
+        if not self._auto_stop_pending:
+            return
+        try:
+            stopped = {
+                slot: source.wait_stopped(timeout=0.0)
+                for slot, source in self._sources.items()
+            }
+        except Exception as exc:
+            self._auto_stop_pending = False
+            self._auto_stop_result = "failed"
+            self._last_error = self._safe_error(exc)
+            self._operation = "Recording finalized, but automatic capture stop failed"
+            self.action_failed.emit("auto_stop", self._last_error)
+            return
+        if all(stopped.values()):
+            self._auto_stop_pending = False
+            self._auto_stop_result = "stopped"
+            status = str(self._final_record.status) if self._final_record is not None else "unconfirmed"
+            self._operation = (
+                f"Recording finalized as {status}; both synthetic capture sources stopped automatically"
+            )
+            self.action_finished.emit("auto_stop", {
+                "stopped": stopped,
+                "recording_status": str(self._final_record.status),
+                "data_complete": self._final_record.data_complete,
+            })
+            return
+        if (
+            self._auto_stop_requested_at is not None
+            and time.monotonic() - self._auto_stop_requested_at >= SHUTDOWN_UNRESOLVED_WARNING_SECONDS
+            and not self._auto_stop_warning_emitted
+        ):
+            self._auto_stop_warning_emitted = True
+            self.action_failed.emit(
+                "auto_stop",
+                "Recording is finalized, but one or more synthetic source stops are not yet acknowledged; "
+                "use Stop Both to retry shutdown.",
+            )
 
     def _publish_snapshot(self) -> None:
         coordinator_snapshot = self._coordinator.snapshot() if self._coordinator is not None else None
@@ -805,13 +914,44 @@ class _SyntheticRecordingWorker(QObject):
             stream.slot for stream in stream_views
             if stream.capture_state in {"starting", "running", "stopping"}
         ]
-        if not active_capture_slots:
-            capture_status_message = "Synthetic capture is stopped."
-        elif self._finalization_unconfirmed or recording_state.startswith("Failed"):
+        if self._finalization_unconfirmed or recording_state.startswith("Failed"):
             capture_status_message = (
                 "Recording finalization is unconfirmed; the experiment is not reported as saved. "
-                "Synthetic capture is still running; use Stop Both to stop the sources."
+                "Synthetic capture is stopped or remains under user control; use Stop Both if sources are active."
             )
+        elif self._auto_stop_pending:
+            status = str(self._final_record.status) if self._final_record is not None else "finalized"
+            capture_status_message = (
+                f"Recording finalized as {status}. Both synthetic capture sources were asked to stop; "
+                "waiting for shutdown acknowledgement."
+            )
+        elif self._auto_stop_result == "stopped":
+            record = self._final_record
+            failed_slots = [stream.slot for stream in stream_views if stream.capture_state == CaptureState.FAILED.value]
+            if record is not None and str(record.status) == "completed" and record.data_complete and not failed_slots:
+                capture_status_message = (
+                    "Recording completed and saved. Both synthetic capture sources stopped automatically."
+                )
+            elif failed_slots:
+                failed_text = ", ".join(f"Camera {slot}" for slot in failed_slots)
+                capture_status_message = (
+                    f"Recording finalized as {record.status if record is not None else 'unconfirmed'}; "
+                    f"{failed_text} failed before shutdown and the remaining synthetic source stopped automatically. "
+                    "Review the experiment status and completeness before interpreting its measurements."
+                )
+            else:
+                status = str(record.status) if record is not None else "unconfirmed"
+                capture_status_message = (
+                    f"Recording finalized as {status}; both synthetic capture sources stopped automatically. "
+                    "Review the experiment status and completeness before interpreting its measurements."
+                )
+        elif self._auto_stop_result == "failed":
+            capture_status_message = (
+                "Recording is finalized, but automatic source shutdown failed. "
+                "Capture may still be running; use Stop Both to retry."
+            )
+        elif not active_capture_slots:
+            capture_status_message = "Synthetic capture is stopped."
         elif self._bridge is not None and self._bridge.snapshot()[0] is BridgeState.FINALIZED:
             record = self._final_record or getattr(self._bridge, "_final_record", None)
             if record is not None and str(record.status) == "completed" and record.data_complete:
@@ -842,6 +982,7 @@ class _SyntheticRecordingWorker(QObject):
             writer_status=writer_status,
             streams=(stream_views[0], stream_views[1]),
             last_error=self._last_error,
+            automatic_capture_stop_pending=self._auto_stop_pending,
         )
         self.snapshot_ready.emit(view)
 
@@ -939,7 +1080,7 @@ class SyntheticRecordingWindow(QWidget):
     """Standalone fake-camera UI. Not part of LiveWorkbenchWindow or `celab gui`."""
 
     request_start_both = Signal(int, int)
-    request_record_both = Signal(float)
+    request_record_both = Signal(float, bool)
     request_stop_recording = Signal()
     request_stop_stream = Signal(str)
     request_stop_both = Signal()
@@ -1021,6 +1162,18 @@ class SyntheticRecordingWindow(QWidget):
         options.addStretch(1)
         page.addLayout(options)
 
+        self.keep_capture_running_checkbox = QCheckBox(
+            "Keep synthetic capture running after recording finishes"
+        )
+        self.keep_capture_running_checkbox.setChecked(False)
+        self.keep_capture_running_checkbox.setToolTip(
+            "When unchecked, a naturally completed fixed-duration recording stops both fake capture sources "
+            "after database finalization is acknowledged. Manual Stop Recording always leaves capture running."
+        )
+        self.keep_capture_running_checkbox.setStyleSheet("color: palette(text);")
+        self.keep_capture_running_checkbox.toggled.connect(self._update_controls)
+        page.addWidget(self.keep_capture_running_checkbox)
+
         buttons = QHBoxLayout()
         self.start_both_button = QPushButton("Start Both")
         self.record_both_button = QPushButton("Record Both")
@@ -1087,7 +1240,10 @@ class SyntheticRecordingWindow(QWidget):
     @Slot()
     def _request_record(self) -> None:
         self._set_requested("Record Both requested; awaiting writer and stream-start acknowledgement.")
-        self.request_record_both.emit(float(self.duration.currentData()))
+        self.request_record_both.emit(
+            float(self.duration.currentData()),
+            self.keep_capture_running_checkbox.isChecked(),
+        )
 
     @Slot()
     def _request_stop_recording(self) -> None:
@@ -1159,6 +1315,11 @@ class SyntheticRecordingWindow(QWidget):
                 f"Finalization transaction committed with status {result.get('status')}; "
                 f"data complete={result.get('data_complete', 'unknown')}."
             )
+        elif action == "auto_stop" and isinstance(result, dict):
+            self.state_label.setText(
+                f"Recording finalized as {result.get('recording_status')}; "
+                "both synthetic capture sources stopped automatically."
+            )
         else:
             self.state_label.setText(f"{action.replace('_', ' ').title()} acknowledged: {result}")
         self._update_controls()
@@ -1169,7 +1330,10 @@ class SyntheticRecordingWindow(QWidget):
         if action == "inspect" and self._shutdown_requested.is_set():
             self._update_controls()
             return
-        self.state_label.setText(f"{action.replace('_', ' ').title()} failed: {message}")
+        if action == "auto_stop":
+            self.state_label.setText(f"Automatic capture stop needs attention: {message}")
+        else:
+            self.state_label.setText(f"{action.replace('_', ' ').title()} failed: {message}")
         self._update_controls()
 
     @Slot(bool, str)
@@ -1227,7 +1391,10 @@ class SyntheticRecordingWindow(QWidget):
         recording_active = recording_state.startswith("Recording") or recording_state.startswith("Starting")
         busy = self._pending_action is not None or self._close_pending or self._close_complete
         self.start_both_button.setEnabled(acknowledged and not busy and not active)
-        self.record_both_button.setEnabled(acknowledged and not busy and bool(active) and not recording_active)
+        auto_stop_pending = bool(view and view.automatic_capture_stop_pending)
+        self.record_both_button.setEnabled(
+            acknowledged and not busy and bool(active) and not recording_active and not auto_stop_pending
+        )
         self.stop_recording_button.setEnabled(acknowledged and not busy and recording_active)
         self.stop_a_button.setEnabled(acknowledged and not busy and "A" in active)
         self.stop_b_button.setEnabled(acknowledged and not busy and "B" in active)
@@ -1236,6 +1403,9 @@ class SyntheticRecordingWindow(QWidget):
         self.rate_a.setEnabled(acknowledged and not busy and not active)
         self.rate_b.setEnabled(acknowledged and not busy and not active)
         self.duration.setEnabled(acknowledged and not busy and not recording_active)
+        self.keep_capture_running_checkbox.setEnabled(
+            acknowledged and not busy and not recording_active and not auto_stop_pending
+        )
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)

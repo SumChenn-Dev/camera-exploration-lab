@@ -56,7 +56,11 @@ from ..grouped_recording import (
     GroupedExperimentSpec,
     GroupedStreamSpec,
 )
-from ..grouped_analysis import GroupedExperimentAnalysis, load_grouped_analysis
+from ..grouped_analysis import (
+    GroupedAnalysisCancelled,
+    GroupedExperimentAnalysis,
+    load_grouped_analysis,
+)
 from ..grouped_recording_coordinator import (
     DEFAULT_STREAM_QUEUE_CAPACITY,
     CoordinatorState,
@@ -480,8 +484,16 @@ class _SyntheticRecordingWorker(QObject):
         if self._repository is None or self._session_id is None or self._database is None:
             self.action_failed.emit("inspect", "No synthetic grouped experiment exists yet.")
             return
+        if self._shutdown_requested.is_set():
+            return
         try:
-            analysis = load_grouped_analysis(self._database, self._session_id)
+            analysis = load_grouped_analysis(
+                self._database,
+                self._session_id,
+                cancellation_check=self._shutdown_requested.is_set,
+            )
+            if self._shutdown_requested.is_set():
+                return
             group = analysis.group
             detail = {
                 "session_id": group.session_id,
@@ -505,21 +517,28 @@ class _SyntheticRecordingWorker(QObject):
                 } for item in analysis.streams),
                 "grouped_analysis": analysis,
             }
-            recovery = self._database.inspect_recording_recovery() if self._database is not None else None
-            if recovery is not None:
+            if analysis.recovery_schema_version is not None:
+                finding = analysis.recovery_finding
+                findings = () if finding is None else ({
+                    "session_id": finding.session_id,
+                    "status": finding.status,
+                    "classification": finding.classification.value,
+                    "lease_present": finding.lease_present,
+                },)
                 detail["read_only_recovery"] = {
-                    "schema_version": recovery.schema_version,
-                    "lock_state": recovery.lock_state.value,
-                    "findings": tuple({
-                        "session_id": finding.session_id,
-                        "status": finding.status,
-                        "classification": finding.classification.value,
-                        "lease_present": finding.lease_present,
-                    } for finding in recovery.findings),
+                    "schema_version": analysis.recovery_schema_version,
+                    "lock_state": analysis.recovery_lock_state,
+                    "findings": findings,
                 }
-            self.action_finished.emit("inspect", detail)
+            if not self._shutdown_requested.is_set():
+                self.action_finished.emit("inspect", detail)
+        except GroupedAnalysisCancelled:
+            # Window shutdown owns the cancellation; do not publish a stale
+            # partial result or present normal cancellation as an error.
+            return
         except Exception as exc:
-            self.action_failed.emit("inspect", self._safe_error(exc))
+            if not self._shutdown_requested.is_set():
+                self.action_failed.emit("inspect", self._safe_error(exc))
 
     @Slot()
     def request_shutdown(self) -> None:
@@ -1086,7 +1105,10 @@ class SyntheticRecordingWindow(QWidget):
 
     @Slot()
     def _request_inspect(self) -> None:
-        self.inspection_label.setText("Inspect requested; reading the isolated synthetic group.")
+        if self._pending_action is not None or self._close_pending or self._close_complete:
+            return
+        self._set_requested("Inspecting the isolated synthetic group…")
+        self.inspection_label.setText("Loading committed samples and preparing bounded plots…")
         self.request_inspect_group.emit()
 
     def _set_requested(self, message: str) -> None:
@@ -1111,6 +1133,9 @@ class SyntheticRecordingWindow(QWidget):
     @Slot(str, object)
     def _on_action_finished(self, action: str, result: object) -> None:
         self._pending_action = None
+        if action == "inspect" and self._shutdown_requested.is_set():
+            self._update_controls()
+            return
         if action == "inspect":
             self.inspection_label.setText(self._format_inspection(result))
             if isinstance(result, dict) and isinstance(result.get("grouped_analysis"), GroupedExperimentAnalysis):
@@ -1141,6 +1166,9 @@ class SyntheticRecordingWindow(QWidget):
     @Slot(str, str)
     def _on_action_failed(self, action: str, message: str) -> None:
         self._pending_action = None
+        if action == "inspect" and self._shutdown_requested.is_set():
+            self._update_controls()
+            return
         self.state_label.setText(f"{action.replace('_', ' ').title()} failed: {message}")
         self._update_controls()
 

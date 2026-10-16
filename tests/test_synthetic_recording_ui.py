@@ -112,6 +112,24 @@ class SyntheticRecordingUiTests(unittest.TestCase):
         for _ in range(count):
             source.emit_frame(time.monotonic_ns())
 
+    def test_inspect_request_disables_duplicate_load_actions(self) -> None:
+        window = self.make_window()
+        window.acknowledgement.setChecked(True)
+        dispatched = []
+        window.request_inspect_group.connect(lambda: dispatched.append("inspect"))
+
+        window._request_inspect()
+        self.assertFalse(window.inspect_button.isEnabled())
+        self.assertIn("Loading committed samples", window.inspection_label.text())
+        self.assertEqual(dispatched, ["inspect"])
+
+        # A rapid repeated slot invocation is ignored while the first request
+        # is pending, so it cannot enqueue a second long-running read.
+        window._request_inspect()
+        self.assertEqual(dispatched, ["inspect"])
+        self.assertTrue(wait_until(lambda: window._pending_action is None))
+        self.assertIn("Inspect failed", window.state_label.text())
+
     def test_cli_requires_synthetic_ack_and_rejects_database_path(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parse_demo_args([])
@@ -198,6 +216,34 @@ class SyntheticRecordingUiTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: window._close_complete))
         self.assertFalse(window._thread.isRunning())
 
+    def test_close_during_grouped_analysis_cancels_loader_without_stale_result(self) -> None:
+        window = self.make_window(auto_emit=True)
+        self.acknowledge_and_start(window)
+        window.duration.setCurrentIndex(0)
+        window.record_both_button.click()
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and window._latest_view.recording_state == "completed", 4.0))
+
+        entered = threading.Event()
+        from camera_exploration_lab.grouped_analysis import GroupedAnalysisCancelled
+
+        def wait_for_shutdown(_database, _session_id, *, cancellation_check=None):
+            entered.set()
+            while cancellation_check is not None and not cancellation_check():
+                time.sleep(0.001)
+            raise GroupedAnalysisCancelled("synthetic viewer close cancellation")
+
+        with patch(
+            "camera_exploration_lab.ui.synthetic_recording_harness.load_grouped_analysis",
+            side_effect=wait_for_shutdown,
+        ):
+            window._request_inspect()
+            self.assertTrue(wait_until(entered.is_set))
+            window.close()
+            self.assertTrue(wait_until(lambda: window._close_complete, 4.0))
+        self.assertIsNone(window._explorer_dialog)
+        self.assertFalse(window._thread.isRunning())
+
     def test_inspection_counts_one_and_two_frame_rows_not_zero_based_indexes(self) -> None:
         window = self.make_window()
         self.acknowledge_and_start(window)
@@ -231,8 +277,11 @@ class SyntheticRecordingUiTests(unittest.TestCase):
         window._worker.action_finished.connect(
             lambda action, result: inspection_results.append(result) if action == "inspect" else None
         )
-        window.inspect_button.click()
-        self.assertTrue(wait_until(lambda: bool(inspection_results)))
+        database = window._worker._database
+        with patch.object(database, "inspect_recording_recovery", wraps=database.inspect_recording_recovery) as recovery_spy:
+            window.inspect_button.click()
+            self.assertTrue(wait_until(lambda: bool(inspection_results)))
+        self.assertEqual(recovery_spy.call_count, 1, "reuse the loader's recovery snapshot instead of rescanning twice")
         inspected = {item["slot"]: item for item in inspection_results[-1]["streams"]}
         self.assertEqual(inspected["A"]["persisted_samples"], 1)
         self.assertEqual(inspected["B"]["persisted_samples"], 2)

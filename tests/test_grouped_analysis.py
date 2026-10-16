@@ -10,7 +10,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
-from camera_exploration_lab.grouped_analysis import load_grouped_analysis
+from camera_exploration_lab.grouped_analysis import (
+    GroupedAnalysisCancelled,
+    load_grouped_analysis,
+)
 from camera_exploration_lab.grouped_recording import (
     GroupStatus,
     GroupedExperimentRepository,
@@ -176,6 +179,28 @@ class GroupedAnalysisTests(unittest.TestCase):
         self.assertFalse(stream.effective_data_complete)
         self.assertTrue(any("do not prove camera sensor frame drops" in note for note in stream.warnings))
 
+    def test_null_sample_indexes_remain_first_in_sqlite_ascending_order(self) -> None:
+        # SQLite ASC orders NULL before numbered indexes. Removing the old
+        # explicit NULL boolean key must preserve the previous cursor order.
+        benchmark_id = self.group.streams[0].benchmark_id
+        with self.database.connect() as connection:
+            connection.executemany(
+                """INSERT INTO measurements
+                   (id, benchmark_id, metric, value, unit, stream_scope, observed_at,
+                    elapsed_seconds, sample_index, interval_ns, method, elapsed_ns)
+                   VALUES (?, ?, 'frame_arrival', 1, 'frame', 'capture', ?, ?, ?, ?, ?, ?)""",
+                (
+                    ("synthetic-index-1", benchmark_id, "2026-03-01T12:00:01+00:00", 0.02, 1, 10_000_000, "synthetic", 20_000_000),
+                    ("synthetic-null-index", benchmark_id, "2026-03-01T12:00:01+00:00", 0.03, None, 10_000_000, "synthetic", 30_000_000),
+                    ("synthetic-index-0", benchmark_id, "2026-03-01T12:00:01+00:00", 0.01, 0, None, "synthetic", 10_000_000),
+                ),
+            )
+        stream = load_grouped_analysis(self.database, self.group.session_id).stream("A")
+        self.assertEqual(stream.persisted_frame_samples, 3)
+        self.assertEqual(stream.last_sequence_index, 1)
+        self.assertEqual(stream.interval_stats.count, 1)
+        self.assertAlmostEqual(stream.interval_stats.mean or 0, 10.0)
+
     def test_zero_and_negative_intervals_are_reported_not_plotted_as_positive_samples(self) -> None:
         self.insert_frames(self.group, "A", [0, 1, 2], [10_000_000, 10_000_000, 20_000_000])
         stream_id = self.group.streams[0].benchmark_id
@@ -196,6 +221,8 @@ class GroupedAnalysisTests(unittest.TestCase):
         self.insert_frames(self.group, "A", [0, 1, 2], [10_000_000, 20_000_000, 30_000_000])
         self.insert_frames(self.group, "B", [0, 1, 2], [60_000_000, 100_000_000, 140_000_000])
         result = load_grouped_analysis(self.database, self.group.session_id)
+        self.assertIsNotNone(result.recovery_schema_version)
+        self.assertEqual(result.recovery_lock_state, "available")
         self.assertTrue(result.shared_time_available)
         self.assertAlmostEqual(result.shared_start_offset_seconds or 0, 0.05)
         self.assertEqual(result.shared_time_reason, None)
@@ -332,18 +359,61 @@ class GroupedAnalysisTests(unittest.TestCase):
         self.assertFalse(result.stream("A").interval_histogram.centers_ms)
         self.assertTrue(result.stream("A").warnings)
 
-    def test_large_plot_series_are_bounded_and_preserve_interval_extrema(self) -> None:
+    def test_large_plot_series_are_bounded_and_preserve_rare_high_and_low_outliers(self) -> None:
         count = 12_000
         times = [10_000_000 + i * 10_000_000 for i in range(count)]
+        # One rare short interval and one unusually long interval must remain
+        # visible in the extrema-preserving plot series.
+        times[5_000] = times[4_999] + 1_000_000
         times[6_100:] = [value + 50_990_000_000 for value in times[6_100:]]
         self.insert_frames(self.group, "A", list(range(count)), times)
         result = load_grouped_analysis(self.database, self.group.session_id, max_plot_points=64)
         stream = result.stream("A")
+        plotted_intervals = {point[1] for point in stream.interval_points_shared}
+        expected_sum_ms = (count - 4) * 10.0 + 1.0 + 19.0 + 51_000.0
         self.assertEqual(stream.persisted_frame_samples, count)
+        self.assertEqual(stream.interval_stats.count, count - 1)
         self.assertLessEqual(len(stream.interval_points_shared), 64)
         self.assertLessEqual(len(stream.fps_points_shared), 64)
+        self.assertAlmostEqual(stream.interval_stats.minimum or 0, 1.0, delta=0.001)
         self.assertAlmostEqual(stream.interval_stats.maximum or 0, 51_000.0, delta=1.0)
-        self.assertAlmostEqual(stream.interval_stats.mean or 0, (11_999 * 10 + 51_000) / 11_999, delta=0.1)
+        self.assertAlmostEqual(stream.interval_stats.mean or 0, expected_sum_ms / (count - 1), delta=0.001)
+        self.assertIn(1.0, plotted_intervals)
+        self.assertIn(51_000.0, plotted_intervals)
+
+    def test_analysis_cancellation_interrupts_streaming_without_mutating_database(self) -> None:
+        count = 2_000
+        self.insert_frames(
+            self.group,
+            "A",
+            list(range(count)),
+            [10_000_000 + i * 5_000_000 for i in range(count)],
+        )
+        before = hashlib.sha256(self.database.path.read_bytes()).hexdigest()
+        checks = 0
+
+        def cancel_during_first_stream() -> bool:
+            nonlocal checks
+            checks += 1
+            return checks >= 4
+
+        with self.assertRaises(GroupedAnalysisCancelled):
+            load_grouped_analysis(
+                self.database,
+                self.group.session_id,
+                cancellation_check=cancel_during_first_stream,
+            )
+        self.assertGreaterEqual(checks, 4)
+        after = hashlib.sha256(self.database.path.read_bytes()).hexdigest()
+        self.assertEqual(before, after)
+
+    def test_analysis_cancellation_before_open_does_not_query_database(self) -> None:
+        with self.assertRaises(GroupedAnalysisCancelled):
+            load_grouped_analysis(
+                self.database,
+                self.group.session_id,
+                cancellation_check=lambda: True,
+            )
 
 
 class GroupedExplorerUiTests(unittest.TestCase):

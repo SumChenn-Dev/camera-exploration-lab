@@ -9,14 +9,23 @@ No camera, user database, or arbitrary database path is accepted.
 from __future__ import annotations
 
 import argparse
+import cProfile
+import io
 import json
+import pstats
 import sqlite3
+import statistics
 import tempfile
 import time
+import tracemalloc
 from pathlib import Path
 
 from camera_exploration_lab.db import Database
-from camera_exploration_lab.grouped_analysis import load_grouped_analysis
+from camera_exploration_lab.grouped_analysis import (
+    _exact_interval_percentiles,
+    _shared_time_supports,
+    load_grouped_analysis,
+)
 from camera_exploration_lab.grouped_recording import (
     GroupStatus,
     GroupedExperimentRepository,
@@ -130,7 +139,71 @@ def _insert_stream(
     return total
 
 
-def run_scenario(duration: int, fps_a: int, fps_b: int) -> dict[str, object]:
+def _measure_analysis_stages(database: Database, session_id: str, model) -> dict[str, object]:
+    """Measure read phases independently after the uncontaminated load timings."""
+    repository = GroupedExperimentRepository(database)
+    started = time.perf_counter()
+    with database.connect_readonly() as connection:
+        group = repository.read_group_snapshot(connection, session_id)
+    connection_snapshot_ms = (time.perf_counter() - started) * 1000
+    if group is None:
+        raise RuntimeError("synthetic grouped snapshot disappeared during profiling")
+
+    per_stream_scan_ms: dict[str, float] = {}
+    scanned_rows: dict[str, int] = {}
+    percentile_started = time.perf_counter()
+    with database.connect_readonly() as connection:
+        for stream in group.streams:
+            scan_started = time.perf_counter()
+            cursor = connection.cursor()
+            cursor.row_factory = None
+            cursor.execute(
+                """SELECT sample_index, elapsed_ns, elapsed_seconds, interval_ns
+                   FROM measurements
+                   WHERE benchmark_id=? AND metric='frame_arrival' AND stream_scope='capture'
+                   ORDER BY sample_index,id""",
+                (stream.benchmark_id,),
+            )
+            count = 0
+            for _sample_index, _elapsed_ns, _elapsed_seconds, _interval_ns in cursor:
+                count += 1
+            per_stream_scan_ms[stream.slot] = round((time.perf_counter() - scan_started) * 1000, 3)
+            scanned_rows[stream.slot] = count
+        percentile_started = time.perf_counter()
+        for stream in group.streams:
+            valid_count = model.stream(stream.slot).interval_stats.count
+            _exact_interval_percentiles(connection, stream.benchmark_id, valid_count)
+        percentile_ms = round((time.perf_counter() - percentile_started) * 1000, 3)
+
+    recovery_started = time.perf_counter()
+    database.inspect_recording_recovery()
+    recovery_ms = round((time.perf_counter() - recovery_started) * 1000, 3)
+
+    alignment_started = time.perf_counter()
+    for _ in range(1000):
+        _shared_time_supports(group, model.streams)
+    alignment_1000_ms = round((time.perf_counter() - alignment_started) * 1000, 3)
+    return {
+        "connect_and_group_snapshot_ms": round(connection_snapshot_ms, 3),
+        "measurement_scan_and_tuple_materialization_ms_by_stream": per_stream_scan_ms,
+        "scanned_rows_by_stream": scanned_rows,
+        "exact_percentile_sql_ms_both_streams": percentile_ms,
+        "read_only_recovery_inspection_ms": recovery_ms,
+        "time_alignment_metadata_1000_calls_ms": alignment_1000_ms,
+        "note": "phase probes are separate warm-cache passes and are not additive to full load time",
+    }
+
+
+def run_scenario(
+    duration: int,
+    fps_a: int,
+    fps_b: int,
+    *,
+    repeats: int = 3,
+    measure_memory: bool = False,
+    profile: bool = False,
+    measure_offscreen_gui: bool = False,
+) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="cel-grouped-analysis-bench-") as directory:
         path = Path(directory) / "synthetic-v3.sqlite3"
         with sqlite3.connect(path) as connection:
@@ -158,9 +231,61 @@ def run_scenario(duration: int, fps_a: int, fps_b: int) -> dict[str, object]:
             termination_reason="synthetic_duration_elapsed",
         )
         database_bytes = path.stat().st_size
-        started = time.perf_counter()
-        model = load_grouped_analysis(database, group.session_id)
-        analysis_seconds = time.perf_counter() - started
+        analysis_runs: list[float] = []
+        model = None
+        for _ in range(repeats):
+            started = time.perf_counter()
+            model = load_grouped_analysis(database, group.session_id)
+            analysis_runs.append(time.perf_counter() - started)
+        analysis_seconds = statistics.median(analysis_runs)
+
+        analysis_python_peak_kib = None
+        if measure_memory:
+            # Isolate allocation tracing from all timed runs. tracemalloc can
+            # dominate wall time in allocation-heavy Python loops.
+            tracemalloc.start()
+            tracemalloc.reset_peak()
+            try:
+                measured_model = load_grouped_analysis(database, group.session_id)
+                _current, peak_bytes = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            if sum(item.persisted_frame_samples for item in measured_model.streams) != rows_a + rows_b:
+                raise RuntimeError("memory-profile pass returned an inconsistent row count")
+            analysis_python_peak_kib = round(peak_bytes / 1024)
+
+        stage_probes = _measure_analysis_stages(database, group.session_id, model) if profile else None
+        profile_summary = None
+        if profile:
+            profiler = cProfile.Profile()
+            profiler.enable()
+            load_grouped_analysis(database, group.session_id)
+            profiler.disable()
+            report = io.StringIO()
+            pstats.Stats(profiler, stream=report).strip_dirs().sort_stats("cumulative").print_stats(18)
+            profile_summary = report.getvalue()
+
+        gui_timings = None
+        if measure_offscreen_gui:
+            from PySide6.QtWidgets import QApplication
+            from camera_exploration_lab.ui.synthetic_grouped_explorer import GroupedExperimentExplorerDialog
+
+            app = QApplication.instance() or QApplication([])
+            construct_started = time.perf_counter()
+            dialog = GroupedExperimentExplorerDialog(model)
+            construct_seconds = time.perf_counter() - construct_started
+            display_started = time.perf_counter()
+            dialog.show()
+            app.processEvents()
+            first_display_seconds = time.perf_counter() - display_started
+            dialog.close()
+            app.processEvents()
+            gui_timings = {
+                "plot_widget_construction_ms": round(construct_seconds * 1000, 3),
+                "offscreen_first_show_and_process_events_ms": round(first_display_seconds * 1000, 3),
+                "note": "offscreen Qt timings; not desktop frame-rate measurements",
+            }
+
         with database.connect_readonly() as connection:
             integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
             foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -173,7 +298,12 @@ def run_scenario(duration: int, fps_a: int, fps_b: int) -> dict[str, object]:
             "database_bytes": database_bytes,
             "insert_seconds": round(insert_seconds, 3),
             "insert_rows_per_second": round((rows_a + rows_b) / insert_seconds, 1),
-            "analysis_load_seconds": round(analysis_seconds, 3),
+            "analysis_load_seconds_median": round(analysis_seconds, 3),
+            "analysis_load_runs_seconds": [round(value, 3) for value in analysis_runs],
+            "analysis_python_peak_kib": analysis_python_peak_kib,
+            "analysis_profile_top_cumulative": profile_summary,
+            "analysis_stage_probes": stage_probes,
+            "offscreen_gui_timings": gui_timings,
             "analysis_row_counts": {
                 "A": model.stream("A").persisted_frame_samples,
                 "B": model.stream("B").persisted_frame_samples,
@@ -196,12 +326,30 @@ def run_scenario(duration: int, fps_a: int, fps_b: int) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--synthetic-only", action="store_true", required=True)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--measure-memory", action="store_true",
+                        help="run one separate traced Analysis pass for the largest synthetic case")
+    parser.add_argument("--profile-largest", action="store_true",
+                        help="print a separate cProfile report for the largest synthetic case")
+    parser.add_argument("--offscreen-gui-largest", action="store_true",
+                        help="measure Qt plot construction/show under the offscreen platform")
     args = parser.parse_args()
+    if args.repeats < 1:
+        parser.error("--repeats must be at least 1")
     if not args.synthetic_only:
         parser.error("--synthetic-only is required")
     print("Synthetic timing rows only; no camera or user database is opened.", flush=True)
     for duration, fps_a, fps_b in SCENARIOS:
-        print(json.dumps(run_scenario(duration, fps_a, fps_b), sort_keys=True), flush=True)
+        is_largest = duration == 1800 and fps_a == 187 and fps_b == 30
+        print(json.dumps(run_scenario(
+            duration,
+            fps_a,
+            fps_b,
+            repeats=args.repeats,
+            measure_memory=args.measure_memory and is_largest,
+            profile=args.profile_largest and is_largest,
+            measure_offscreen_gui=args.offscreen_gui_largest and is_largest,
+        ), sort_keys=True), flush=True)
     return 0
 
 

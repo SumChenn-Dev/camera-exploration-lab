@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .analysis import (
     DEFAULT_MAX_PLOT_POINTS,
@@ -26,7 +26,7 @@ from .grouped_recording import (
     GroupedExperimentRepository,
     GroupedStreamRecord,
 )
-from .recording_ownership import RecoveryClassification
+from .recording_ownership import RecoveryClassification, RecoveryFinding
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +89,9 @@ class GroupedExperimentAnalysis:
     group: GroupedExperimentRecord
     streams: tuple[GroupedStreamAnalysis, GroupedStreamAnalysis]
     recovery_classification: str | None
+    recovery_schema_version: int | None
+    recovery_lock_state: str | None
+    recovery_finding: RecoveryFinding | None
     shared_time_available: bool
     shared_time_reason: str | None
     shared_start_offset_seconds: float | None
@@ -128,45 +131,82 @@ class GroupedExperimentAnalysis:
         return status
 
 
+class GroupedAnalysisCancelled(RuntimeError):
+    """Raised when a read-only grouped Analysis load is deliberately cancelled."""
+
+
+def _raise_if_cancelled(cancellation_check: Callable[[], bool] | None) -> None:
+    if cancellation_check is not None and cancellation_check():
+        raise GroupedAnalysisCancelled("Grouped Analysis loading was cancelled.")
+
+
 def load_grouped_analysis(
     database: Database,
     session_id: str,
     *,
     max_plot_points: int = DEFAULT_MAX_PLOT_POINTS,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> GroupedExperimentAnalysis:
     """Load a grouped experiment from one query-only SQLite snapshot.
 
     Measurement iteration is streaming. Full-data statistics are accumulated
     before plotting; only extrema-preserving, bounded plot points are returned.
+    An optional cancellation check interrupts long SQLite queries and the
+    streaming pass without changing the database.
     """
     if max_plot_points < 4:
         raise ValueError("max_plot_points must be at least 4")
+    _raise_if_cancelled(cancellation_check)
     repository = GroupedExperimentRepository(database)
-    with database.connect_readonly() as connection:
-        group = repository.read_group_snapshot(connection, session_id)
-        if group is None:
-            raise ValueError("The selected synthetic grouped experiment was not found.")
-        shared_plot_duration = _shared_plot_duration(group)
-        streams = tuple(
-            _load_stream(
-                connection,
-                stream,
-                max_plot_points=max_plot_points,
-                shared_plot_duration=shared_plot_duration,
-            )
-            for stream in group.streams
-        )
+    try:
+        with database.connect_readonly() as connection:
+            if cancellation_check is not None:
+                connection.set_progress_handler(
+                    lambda: 1 if cancellation_check() else 0,
+                    10_000,
+                )
+            try:
+                _raise_if_cancelled(cancellation_check)
+                group = repository.read_group_snapshot(connection, session_id)
+                if group is None:
+                    raise ValueError("The selected synthetic grouped experiment was not found.")
+                shared_plot_duration = _shared_plot_duration(group)
+                stream_results = []
+                for stream in group.streams:
+                    _raise_if_cancelled(cancellation_check)
+                    stream_results.append(_load_stream(
+                        connection,
+                        stream,
+                        max_plot_points=max_plot_points,
+                        shared_plot_duration=shared_plot_duration,
+                        cancellation_check=cancellation_check,
+                    ))
+                streams = (stream_results[0], stream_results[1])
+            finally:
+                if cancellation_check is not None:
+                    connection.set_progress_handler(None, 0)
+    except sqlite3.OperationalError as exc:
+        if cancellation_check is not None and cancellation_check():
+            raise GroupedAnalysisCancelled("Grouped Analysis loading was cancelled.") from exc
+        raise
 
+    _raise_if_cancelled(cancellation_check)
     recovery_classification: str | None = None
+    recovery_schema_version: int | None = None
+    recovery_lock_state: str | None = None
+    recovery_finding: RecoveryFinding | None = None
     recovery_warning: str | None = None
     try:
         recovery = database.inspect_recording_recovery()
-        finding = next((item for item in recovery.findings if item.session_id == session_id), None)
-        if finding is not None:
-            recovery_classification = str(finding.classification)
+        recovery_schema_version = recovery.schema_version
+        recovery_lock_state = recovery.lock_state.value
+        recovery_finding = next((item for item in recovery.findings if item.session_id == session_id), None)
+        if recovery_finding is not None:
+            recovery_classification = str(recovery_finding.classification)
     except Exception:
         recovery_warning = "Read-only recovery status could not be confirmed."
 
+    _raise_if_cancelled(cancellation_check)
     common, common_reason = _shared_time_supports(group, streams)
     offset = None
     if common:
@@ -193,6 +233,9 @@ def load_grouped_analysis(
         group=group,
         streams=(streams[0], streams[1]),
         recovery_classification=recovery_classification,
+        recovery_schema_version=recovery_schema_version,
+        recovery_lock_state=recovery_lock_state,
+        recovery_finding=recovery_finding,
         shared_time_available=common,
         shared_time_reason=common_reason,
         shared_start_offset_seconds=offset,
@@ -225,21 +268,28 @@ def _load_stream(
     *,
     max_plot_points: int,
     shared_plot_duration: float,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> GroupedStreamAnalysis:
     benchmark_id = stream.benchmark_id
-    count_row = connection.execute(
-        """SELECT COUNT(*) AS frame_count, MAX(sample_index) AS last_index
+    aggregate = connection.execute(
+        """SELECT
+               COUNT(CASE WHEN metric='frame_arrival' THEN 1 END) AS frame_count,
+               MAX(CASE WHEN metric='frame_arrival' THEN sample_index END) AS last_index,
+               COUNT(CASE WHEN metric='read_failure' THEN 1 END) AS failure_count,
+               MIN(CASE WHEN metric='frame_arrival' THEN elapsed_ns END) AS min_ns,
+               MAX(CASE WHEN metric='frame_arrival' THEN elapsed_ns END) AS max_ns,
+               COUNT(CASE WHEN metric='frame_arrival' AND elapsed_ns IS NOT NULL THEN 1 END) AS timestamp_count,
+               MIN(CASE WHEN metric='frame_arrival' THEN elapsed_seconds END) AS min_seconds,
+               MAX(CASE WHEN metric='frame_arrival' THEN elapsed_seconds END) AS max_seconds,
+               COUNT(CASE WHEN metric='frame_arrival' AND elapsed_seconds IS NOT NULL THEN 1 END) AS seconds_count
            FROM measurements
-           WHERE benchmark_id=? AND metric='frame_arrival' AND stream_scope='capture'""",
+           WHERE benchmark_id=? AND stream_scope='capture'
+             AND metric IN ('frame_arrival', 'read_failure')""",
         (benchmark_id,),
     ).fetchone()
-    persisted_frames = int(count_row["frame_count"] or 0)
-    last_index = int(count_row["last_index"]) if count_row["last_index"] is not None else None
-    persisted_failures = int(connection.execute(
-        """SELECT COUNT(*) FROM measurements
-           WHERE benchmark_id=? AND metric='read_failure' AND stream_scope='capture'""",
-        (benchmark_id,),
-    ).fetchone()[0])
+    persisted_frames = int(aggregate["frame_count"] or 0)
+    last_index = int(aggregate["last_index"]) if aggregate["last_index"] is not None else None
+    persisted_failures = int(aggregate["failure_count"] or 0)
 
     rate_summary = _summary_value(stream.summary, "capture_fps")
     preview_fps = _summary_value(stream.summary, "preview_fps")
@@ -271,24 +321,15 @@ def _load_stream(
         include_top_level=False,
     )
 
-    # A first aggregate bounds the point decimators before a streaming pass.
-    bounds = connection.execute(
-        """SELECT MIN(elapsed_ns) AS min_ns, MAX(elapsed_ns) AS max_ns,
-                  COUNT(elapsed_ns) AS timestamp_count,
-                  MIN(elapsed_seconds) AS min_seconds, MAX(elapsed_seconds) AS max_seconds,
-                  COUNT(elapsed_seconds) AS seconds_count
-           FROM measurements
-           WHERE benchmark_id=? AND metric='frame_arrival' AND stream_scope='capture'""",
-        (benchmark_id,),
-    ).fetchone()
-    timestamp_count = int(bounds["timestamp_count"] or 0)
-    seconds_count = int(bounds["seconds_count"] or 0)
+    # A combined aggregate bounds plot decimation and row counts in one indexed pass.
+    timestamp_count = int(aggregate["timestamp_count"] or 0)
+    seconds_count = int(aggregate["seconds_count"] or 0)
     use_ns = persisted_frames > 0 and timestamp_count == persisted_frames
     use_seconds = persisted_frames > 0 and seconds_count == persisted_frames
     first_row = connection.execute(
         """SELECT elapsed_ns, elapsed_seconds FROM measurements
            WHERE benchmark_id=? AND metric='frame_arrival' AND stream_scope='capture'
-           ORDER BY sample_index IS NULL, sample_index, id LIMIT 1""",
+           ORDER BY sample_index, id LIMIT 1""",
         (benchmark_id,),
     ).fetchone()
     timestamp_origin_ns = (
@@ -297,7 +338,7 @@ def _load_stream(
         else None
     )
     timestamp_span_s = (
-        max(0.0, (int(bounds["max_ns"]) - int(bounds["min_ns"])) / 1e9)
+        max(0.0, (int(aggregate["max_ns"]) - int(aggregate["min_ns"])) / 1e9)
         if use_ns else 0.0
     )
     timestamp_origin_s = (
@@ -306,7 +347,7 @@ def _load_stream(
         else None
     )
     timestamp_span_s_fallback = (
-        max(0.0, float(bounds["max_seconds"]) - float(bounds["min_seconds"]))
+        max(0.0, float(aggregate["max_seconds"]) - float(aggregate["min_seconds"]))
         if use_seconds else 0.0
     )
     span_seconds = timestamp_span_s if use_ns else timestamp_span_s_fallback
@@ -350,19 +391,23 @@ def _load_stream(
     previous_elapsed_ns: int | None = None
     previous_elapsed_seconds: float | None = None
 
-    cursor = connection.execute(
+    cursor = connection.cursor()
+    cursor.row_factory = None
+    cursor.execute(
         """SELECT sample_index, elapsed_ns, elapsed_seconds, interval_ns
            FROM measurements
            WHERE benchmark_id=? AND metric='frame_arrival' AND stream_scope='capture'
-           ORDER BY sample_index IS NULL, sample_index, id""",
+           ORDER BY sample_index, id""",
         (benchmark_id,),
     )
     processed = 0
-    for row in cursor:
+    for sample_index, elapsed_ns_value, elapsed_seconds_value, direct_interval_value in cursor:
         processed += 1
-        index = int(row["sample_index"]) if row["sample_index"] is not None else None
-        elapsed_ns = int(row["elapsed_ns"]) if row["elapsed_ns"] is not None else None
-        elapsed_seconds = float(row["elapsed_seconds"]) if row["elapsed_seconds"] is not None else None
+        if processed % 1024 == 0:
+            _raise_if_cancelled(cancellation_check)
+        index = int(sample_index) if sample_index is not None else None
+        elapsed_ns = int(elapsed_ns_value) if elapsed_ns_value is not None else None
+        elapsed_seconds = float(elapsed_seconds_value) if elapsed_seconds_value is not None else None
         if processed == 1:
             if index is not None and index > 0:
                 sequence_gaps += index
@@ -376,7 +421,7 @@ def _load_stream(
         contiguous = (
             index is not None and previous_index is not None and index == previous_index + 1
         )
-        direct_interval = int(row["interval_ns"]) if row["interval_ns"] is not None else None
+        direct_interval = int(direct_interval_value) if direct_interval_value is not None else None
         delta_ns: int | None = None
         if contiguous:
             if elapsed_ns is not None and previous_elapsed_ns is not None:
@@ -420,24 +465,24 @@ def _load_stream(
                     )
                     hist_index = min(HISTOGRAM_BINS - 1, max(0, int(ratio * HISTOGRAM_BINS)))
                 histogram_counts[hist_index] += 1
-                _add_interval_point(
-                    interval_bins_shared,
-                    interval_bins_stream,
-                    shared_bucket_count=shared_interval_bin_count,
-                    stream_bucket_count=stream_interval_bin_count,
-                    shared_bucket_width=shared_interval_bin_width,
-                    stream_bucket_width=stream_interval_bin_width,
-                    elapsed_ns=elapsed_ns, elapsed_seconds=elapsed_seconds,
-                    origin_ns=timestamp_origin_ns, origin_seconds=timestamp_origin_s,
-                    value_ms=interval_ms,
-                )
-                _add_rate_interval(
-                    rate_bins_shared, rate_bins_stream, interval_seconds=delta_ns / 1e9,
-                    elapsed_ns=elapsed_ns, elapsed_seconds=elapsed_seconds,
-                    timestamp_origin_ns=timestamp_origin_ns, timestamp_origin_s=timestamp_origin_s,
+                _add_timing_plot_point(
+                    rate_bins_shared=rate_bins_shared,
+                    rate_bins_stream=rate_bins_stream,
+                    interval_bins_shared=interval_bins_shared,
+                    interval_bins_stream=interval_bins_stream,
+                    interval_ns=delta_ns,
+                    elapsed_ns=elapsed_ns,
+                    elapsed_seconds=elapsed_seconds,
+                    origin_ns=timestamp_origin_ns,
+                    origin_seconds=timestamp_origin_s,
                     shared_window_seconds=shared_window_seconds,
                     stream_window_seconds=stream_window_seconds,
+                    shared_interval_bucket_count=shared_interval_bin_count,
+                    stream_interval_bucket_count=stream_interval_bin_count,
+                    shared_interval_bucket_width=shared_interval_bin_width,
+                    stream_interval_bucket_width=stream_interval_bin_width,
                     max_plot_points=max_plot_points,
+                    interval_ms=interval_ms,
                 )
         previous_index = index
         previous_elapsed_ns = elapsed_ns
@@ -627,20 +672,33 @@ def _shared_plot_duration(group: GroupedExperimentRecord) -> float:
     return max((int(value) for value in elapsed_values), default=0) / 1e9
 
 
-def _add_interval_point(
-    shared: dict[int, _BucketExtrema],
-    per_stream: dict[int, _BucketExtrema],
+def _add_timing_plot_point(
     *,
-    shared_bucket_count: int,
-    stream_bucket_count: int,
-    shared_bucket_width: float,
-    stream_bucket_width: float,
+    rate_bins_shared: dict[int, _BucketRate],
+    rate_bins_stream: dict[int, _BucketRate],
+    interval_bins_shared: dict[int, _BucketExtrema],
+    interval_bins_stream: dict[int, _BucketExtrema],
+    interval_ns: int,
     elapsed_ns: int | None,
     elapsed_seconds: float | None,
     origin_ns: int | None,
     origin_seconds: float | None,
-    value_ms: float,
+    shared_window_seconds: float,
+    stream_window_seconds: float,
+    shared_interval_bucket_count: int,
+    stream_interval_bucket_count: int,
+    shared_interval_bucket_width: float,
+    stream_interval_bucket_width: float,
+    max_plot_points: int,
+    interval_ms: float,
 ) -> None:
+    """Update rate and interval decimators from one valid adjacent pair.
+
+    Each bucket object is allocated only when its key first appears. The two
+    x coordinates are calculated once and reused for both plot families.
+    """
+    if interval_ns <= 0:
+        return
     shared_x = elapsed_ns / 1e9 if elapsed_ns is not None else None
     if elapsed_ns is not None and origin_ns is not None:
         stream_x = (elapsed_ns - origin_ns) / 1e9
@@ -648,53 +706,56 @@ def _add_interval_point(
         stream_x = elapsed_seconds - origin_seconds
     else:
         stream_x = None
-    if shared_x is None and stream_x is None:
-        return
-    for target, x, bucket_count, bucket_width in (
-        (shared, shared_x, shared_bucket_count, shared_bucket_width),
-        (per_stream, stream_x, stream_bucket_count, stream_bucket_width),
-    ):
-        if x is None or not math.isfinite(x):
-            continue
-        index = max(0, min(bucket_count - 1, int(max(0.0, x) / bucket_width)))
-        target.setdefault(index, _BucketExtrema()).add((x, value_ms))
 
+    if shared_x is not None and math.isfinite(shared_x):
+        if shared_x < 0.0:
+            shared_x = 0.0
+        rate_index = int(shared_x / shared_window_seconds)
+        if rate_index >= max_plot_points:
+            rate_index = max_plot_points - 1
+        rate_bucket = rate_bins_shared.get(rate_index)
+        if rate_bucket is None:
+            rate_bucket = _BucketRate()
+            rate_bins_shared[rate_index] = rate_bucket
+        rate_bucket.count += 1
+        rate_bucket.duration_ns += interval_ns
+        rate_bucket.x_sum += shared_x
 
-def _add_rate_interval(
-    shared: dict[int, _BucketRate],
-    per_stream: dict[int, _BucketRate],
-    *,
-    interval_seconds: float,
-    elapsed_ns: int | None,
-    elapsed_seconds: float | None,
-    timestamp_origin_ns: int | None,
-    timestamp_origin_s: float | None,
-    shared_window_seconds: float,
-    stream_window_seconds: float,
-    max_plot_points: int,
-) -> None:
-    if not math.isfinite(interval_seconds) or interval_seconds <= 0:
-        return
-    shared_x = elapsed_ns / 1e9 if elapsed_ns is not None else None
-    if elapsed_ns is not None and timestamp_origin_ns is not None:
-        stream_x = (elapsed_ns - timestamp_origin_ns) / 1e9
-    elif elapsed_seconds is not None and timestamp_origin_s is not None:
-        stream_x = elapsed_seconds - timestamp_origin_s
-    else:
-        stream_x = None
-    for target, x, window_seconds in (
-        (shared, shared_x, shared_window_seconds),
-        (per_stream, stream_x, stream_window_seconds),
-    ):
-        if x is None or not math.isfinite(x):
-            continue
-        index = max(0, int(max(0.0, x) / window_seconds))
-        if index >= max_plot_points:
-            index = max_plot_points - 1
-        bucket = target.setdefault(index, _BucketRate())
-        bucket.count += 1
-        bucket.duration_ns += round(interval_seconds * 1e9)
-        bucket.x_sum += x
+        interval_index = int(shared_x / shared_interval_bucket_width)
+        if interval_index < 0:
+            interval_index = 0
+        elif interval_index >= shared_interval_bucket_count:
+            interval_index = shared_interval_bucket_count - 1
+        interval_bucket = interval_bins_shared.get(interval_index)
+        if interval_bucket is None:
+            interval_bucket = _BucketExtrema()
+            interval_bins_shared[interval_index] = interval_bucket
+        interval_bucket.add((shared_x, interval_ms))
+
+    if stream_x is not None and math.isfinite(stream_x):
+        if stream_x < 0.0:
+            stream_x = 0.0
+        rate_index = int(stream_x / stream_window_seconds)
+        if rate_index >= max_plot_points:
+            rate_index = max_plot_points - 1
+        rate_bucket = rate_bins_stream.get(rate_index)
+        if rate_bucket is None:
+            rate_bucket = _BucketRate()
+            rate_bins_stream[rate_index] = rate_bucket
+        rate_bucket.count += 1
+        rate_bucket.duration_ns += interval_ns
+        rate_bucket.x_sum += stream_x
+
+        interval_index = int(stream_x / stream_interval_bucket_width)
+        if interval_index < 0:
+            interval_index = 0
+        elif interval_index >= stream_interval_bucket_count:
+            interval_index = stream_interval_bucket_count - 1
+        interval_bucket = interval_bins_stream.get(interval_index)
+        if interval_bucket is None:
+            interval_bucket = _BucketExtrema()
+            interval_bins_stream[interval_index] = interval_bucket
+        interval_bucket.add((stream_x, interval_ms))
 
 
 def _flatten_extrema(buckets: dict[int, _BucketExtrema]) -> tuple[tuple[float, float], ...]:
@@ -753,13 +814,13 @@ def _exact_interval_percentiles(
         f"""WITH ordered AS (
                  SELECT sample_index, elapsed_ns, elapsed_seconds, interval_ns,
                         LAG(sample_index) OVER (
-                            ORDER BY sample_index IS NULL, sample_index, id
+                            ORDER BY sample_index, id
                         ) AS previous_index,
                         LAG(elapsed_ns) OVER (
-                            ORDER BY sample_index IS NULL, sample_index, id
+                            ORDER BY sample_index, id
                         ) AS previous_elapsed_ns,
                         LAG(elapsed_seconds) OVER (
-                            ORDER BY sample_index IS NULL, sample_index, id
+                            ORDER BY sample_index, id
                         ) AS previous_elapsed_seconds
                  FROM measurements
                  WHERE benchmark_id=? AND metric='frame_arrival' AND stream_scope='capture'

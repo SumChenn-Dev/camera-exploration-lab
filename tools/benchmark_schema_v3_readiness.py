@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sqlite3
+import statistics
 import tempfile
 import time
 import tracemalloc
@@ -64,8 +65,9 @@ class ScenarioResult:
     legacy_history_ms: float
     grouped_history_ms: float
     grouped_analysis_ms: float
+    grouped_analysis_runs_ms: tuple[float, ...]
     analysis_samples: int
-    python_peak_kib: int
+    analysis_python_peak_kib: int | None
     batch_size: int
 
 
@@ -223,7 +225,6 @@ def run_case(duration: int, fps_a: int, fps_b: int) -> ScenarioResult:
 
         repository = GroupedExperimentRepository(database)
         group = _create_group(repository, duration, fps_a, fps_b)
-        tracemalloc.start()
         persistence_started = time.perf_counter()
         rows_a = _write_stream(repository, group, "A", fps_a, duration)
         rows_b = _write_stream(repository, group, "B", fps_b, duration)
@@ -266,9 +267,33 @@ def run_case(duration: int, fps_a: int, fps_b: int) -> ScenarioResult:
         grouped_started = time.perf_counter()
         groups = repository.list_groups(limit=1000)
         grouped_history_ms = (time.perf_counter() - grouped_started) * 1000
-        analysis_started = time.perf_counter()
-        analysis = load_grouped_analysis(database, group.session_id)
-        grouped_analysis_ms = (time.perf_counter() - analysis_started) * 1000
+        # Time the read path without allocation tracing: tracemalloc has a
+        # large per-allocation cost and previously overstated elapsed time by
+        # tracing synthetic row generation and the analysis pass together.
+        analysis_times_ms: list[float] = []
+        analysis = None
+        for _ in range(3):
+            analysis_started = time.perf_counter()
+            analysis = load_grouped_analysis(database, group.session_id)
+            analysis_times_ms.append((time.perf_counter() - analysis_started) * 1000)
+        grouped_analysis_ms = statistics.median(analysis_times_ms)
+
+        # Bound memory measurement to the largest synthetic analysis case and
+        # keep it separate from timed runs. This reports Python allocations for
+        # Analysis preparation only, not fixture generation or persistence.
+        analysis_python_peak_kib = None
+        if duration == 1800 and fps_a == 187 and fps_b == 30:
+            tracemalloc.start()
+            tracemalloc.reset_peak()
+            try:
+                measured = load_grouped_analysis(database, group.session_id)
+                _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            if sum(item.persisted_frame_samples for item in measured.streams) != rows_a + rows_b:
+                raise RuntimeError("traced analysis pass returned an inconsistent row count")
+            analysis_python_peak_kib = round(peak_bytes / 1024)
+
         with database.connect_readonly() as connection:
             run_ids = tuple(stream.benchmark_id for stream in group.streams)
             placeholders = ",".join("?" for _ in run_ids)
@@ -277,8 +302,6 @@ def run_case(duration: int, fps_a: int, fps_b: int) -> ScenarioResult:
                 "AND metric='frame_arrival' AND stream_scope='capture'",
                 run_ids,
             ).fetchone()[0])
-        _, peak_bytes = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
         expected = rows_a + rows_b
         if persisted != expected:
             raise RuntimeError("synthetic benchmark sample count mismatch")
@@ -303,8 +326,9 @@ def run_case(duration: int, fps_a: int, fps_b: int) -> ScenarioResult:
             legacy_history_ms=round(legacy_history_ms, 3),
             grouped_history_ms=round(grouped_history_ms, 3),
             grouped_analysis_ms=round(grouped_analysis_ms, 3),
+            grouped_analysis_runs_ms=tuple(round(value, 3) for value in analysis_times_ms),
             analysis_samples=sum(item.persisted_frame_samples for item in analysis.streams),
-            python_peak_kib=round(peak_bytes / 1024),
+            analysis_python_peak_kib=analysis_python_peak_kib,
             batch_size=BATCH_SIZE,
         )
 

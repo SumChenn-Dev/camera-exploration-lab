@@ -136,6 +136,19 @@ VENV="$HOME/.local/share/camera-exploration-lab/venv"
 PYTHONPATH=src QT_QPA_PLATFORM=offscreen "$VENV/bin/python" -m unittest discover -v -s tests
 ```
 
+## Inspect a synthetic grouped experiment
+
+The schema-v3 grouped History/Analysis viewer is currently available only inside the explicitly acknowledged fake-camera harness. It does not change normal History or Analysis, which remain on schema v2. From the repository root on Bazzite:
+
+```bash
+QT_QPA_PLATFORM=xcb \
+  "$HOME/.local/share/camera-exploration-lab/venv/bin/python" \
+  tools/run_synthetic_recording_ui.py \
+  --synthetic-only --acknowledge-synthetic-only
+```
+
+Check the in-window synthetic-only acknowledgement, start the fake streams, record or finish a group, choose **Inspect Synthetic Experiment**, then choose **Open in Grouped Analysis**. The harness uses only its own temporary database, refuses database-path arguments, and removes that database on clean shutdown. See [Grouped History and Analysis](docs/GROUPED_HISTORY_ANALYSIS.md) for measurement definitions and limitations.
+
 Physical verification must run in a Bazzite KDE host session, since a container or sandbox may not have access to `/dev/video*`:
 
 ```bash

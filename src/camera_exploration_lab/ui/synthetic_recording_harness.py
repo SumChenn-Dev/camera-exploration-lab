@@ -56,6 +56,7 @@ from ..grouped_recording import (
     GroupedExperimentSpec,
     GroupedStreamSpec,
 )
+from ..grouped_analysis import GroupedExperimentAnalysis, load_grouped_analysis
 from ..grouped_recording_coordinator import (
     DEFAULT_STREAM_QUEUE_CAPACITY,
     CoordinatorState,
@@ -66,6 +67,7 @@ from ..schema_migrations import (
     SYNTHETIC_DATABASE_APPLICATION_ID,
     migrate_synthetic_database_to_v3,
 )
+from .synthetic_grouped_explorer import GroupedExperimentExplorerDialog
 
 SHUTDOWN_UNRESOLVED_WARNING_SECONDS = 5.0
 
@@ -475,29 +477,12 @@ class _SyntheticRecordingWorker(QObject):
 
     @Slot()
     def inspect_group(self) -> None:
-        if self._repository is None or self._session_id is None:
+        if self._repository is None or self._session_id is None or self._database is None:
             self.action_failed.emit("inspect", "No synthetic grouped experiment exists yet.")
             return
         try:
-            group = self._repository.get_group(self._session_id)
-            if group is None:
-                raise RuntimeError("synthetic grouped experiment was not found")
-            if self._database is None:
-                raise RuntimeError("synthetic database is unavailable for read-only inspection")
-            # The persisted sample index is a zero-based sequence number, not a
-            # row count. Count the committed capture timing records directly so
-            # one frame (index 0) is reported as one persisted sample. This
-            # query stays read-only and includes both arrivals and read failures.
-            with self._database.connect_readonly() as connection:
-                persisted_counts = {
-                    stream.benchmark_id: int(connection.execute(
-                        """SELECT COUNT(*) FROM measurements
-                           WHERE benchmark_id=? AND stream_scope='capture'
-                             AND metric IN ('frame_arrival', 'read_failure')""",
-                        (stream.benchmark_id,),
-                    ).fetchone()[0])
-                    for stream in group.streams
-                }
+            analysis = load_grouped_analysis(self._database, self._session_id)
+            group = analysis.group
             detail = {
                 "session_id": group.session_id,
                 "label": group.label,
@@ -505,16 +490,20 @@ class _SyntheticRecordingWorker(QObject):
                 "data_complete": group.data_complete,
                 "integrity_flags": group.integrity_flags,
                 "streams": tuple({
-                    "slot": stream.slot,
-                    "benchmark_id": stream.benchmark_id,
-                    "camera_model": (stream.identity_snapshot or {}).get("model"),
-                    "status": stream.stream_status,
-                    "frames": stream.capture_frame_count,
-                    "failures": stream.read_failure_count,
-                    "persisted_samples": persisted_counts[stream.benchmark_id],
-                    "last_persisted_sample_index": stream.last_persisted_sample_index,
-                    "data_complete": stream.data_complete,
-                } for stream in group.streams),
+                    "slot": item.stream.slot,
+                    "benchmark_id": item.stream.benchmark_id,
+                    "camera_model": (item.stream.identity_snapshot or {}).get("model"),
+                    "status": item.stream.stream_status,
+                    "frames": item.stream.capture_frame_count,
+                    "failures": item.stream.read_failure_count,
+                    "persisted_samples": item.persisted_timing_sample_count,
+                    "persisted_frame_samples": item.persisted_frame_samples,
+                    "persisted_read_failure_samples": item.persisted_read_failure_samples,
+                    "last_persisted_sample_index": item.last_sequence_index,
+                    "interval_count": item.interval_stats.count,
+                    "data_complete": item.effective_data_complete,
+                } for item in analysis.streams),
+                "grouped_analysis": analysis,
             }
             recovery = self._database.inspect_recording_recovery() if self._database is not None else None
             if recovery is not None:
@@ -951,6 +940,7 @@ class SyntheticRecordingWindow(QWidget):
         self._close_pending = False
         self._pending_action: str | None = None
         self._latest_view: SyntheticHarnessView | None = None
+        self._explorer_dialog: GroupedExperimentExplorerDialog | None = None
         self._stream_panels = (_SyntheticStreamPanel("A"), _SyntheticStreamPanel("B"))
 
         self._thread = QThread(self)
@@ -1123,6 +1113,12 @@ class SyntheticRecordingWindow(QWidget):
         self._pending_action = None
         if action == "inspect":
             self.inspection_label.setText(self._format_inspection(result))
+            if isinstance(result, dict) and isinstance(result.get("grouped_analysis"), GroupedExperimentAnalysis):
+                if self._explorer_dialog is not None:
+                    self._explorer_dialog.close()
+                self._explorer_dialog = GroupedExperimentExplorerDialog(result["grouped_analysis"], self)
+                self._explorer_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                self._explorer_dialog.show()
         elif action == "record_both" and isinstance(result, dict):
             if result.get("cancelled"):
                 self.state_label.setText("Recording startup cancelled during shutdown.")
@@ -1226,6 +1222,8 @@ class SyntheticRecordingWindow(QWidget):
         if self._close_complete:
             event.accept()
             return
+        if self._explorer_dialog is not None:
+            self._explorer_dialog.close()
         event.ignore()
         if self._close_pending:
             return

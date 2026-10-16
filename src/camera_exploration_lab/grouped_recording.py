@@ -524,7 +524,25 @@ class GroupedExperimentRepository:
 
     def get_group(self, session_id: str) -> GroupedExperimentRecord | None:
         with self.database.connect_readonly() as connection:
-            return self._read_group(connection, session_id)
+            return self.read_group_snapshot(connection, session_id)
+
+    def read_group_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+    ) -> GroupedExperimentRecord | None:
+        """Read one group from a caller-owned query-only SQLite snapshot.
+
+        This supports grouped History and Analysis loading group metadata and
+        its measurements from the same SQLite read transaction. A writable
+        connection is rejected so callers cannot accidentally use the
+        inspection API as a mutation path.
+        """
+        query_only = connection.execute("PRAGMA query_only").fetchone()
+        if query_only is None or int(query_only[0]) != 1:
+            raise GroupedRepositoryError("group snapshots require a query-only connection")
+        self._require_v3(connection)
+        return self._read_group(connection, session_id)
 
     def list_groups(
         self,

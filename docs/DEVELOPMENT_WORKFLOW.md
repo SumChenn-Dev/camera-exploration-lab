@@ -154,3 +154,15 @@ QT_QPA_PLATFORM=offscreen PYTHONUNBUFFERED=1 PYTHONPATH="$PWD/src:$PWD" \
 ```
 
 Synthetic tests use temporary databases for same-process and cross-process contention, symlink/hardlink aliases, terminal release, abandoned single/grouped recordings, and read-only recovery inspection. The `flock` layer coordinates only application versions that implement it on filesystems with reliable Linux advisory-lock semantics. It is not a universal lock for older CEL versions, unrelated SQLite tools, copied database files, or unsupported network filesystems. An abandoned v3 SQL lease remains blocking until an explicit recovery workflow is reviewed and approved.
+
+## CEL-013 Pass 2C.1 synthetic grouped-recording UI
+
+A standalone fake-camera demonstration can be launched from the canonical checkout with the existing CEL virtual environment:
+
+```bash
+cd "$CHECKOUT"
+PYTHONPATH=src "$VENV/bin/python" tools/run_synthetic_recording_ui.py \
+  --synthetic-only --acknowledge-synthetic-only
+```
+
+This command is for a Bazzite desktop session; it does not set the offscreen Qt platform. The tool requires both flags and then an in-window acknowledgement. It accepts no database path, makes a fresh disposable database only after **Record Both**, and never discovers or opens hardware. Choose Camera A's synthetic 100/187 event rate, Camera B's 24/30 rate, and a 1/5/10 second target; then use **Start Both**, **Record Both**, and **Stop Recording** or wait for the synthetic target. Stop Recording leaves fake streams running. **Inspect Synthetic Experiment** reads the group before close. **Stop Both** finalizes active timing before stopping producers. Closing waits asynchronously for safe teardown. These are synthetic UI and SQLite results, not camera measurements. For camera-free offscreen verification, set `QT_QPA_PLATFORM=offscreen` and run the full unittest command above. Production `celab gui` still has no grouped Record Both control or schema-v3 activation.

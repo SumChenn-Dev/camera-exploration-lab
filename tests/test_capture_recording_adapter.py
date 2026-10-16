@@ -511,6 +511,20 @@ class CaptureRecordingAdapterTests(unittest.TestCase):
         self.assertEqual(record.streams[0].timing_queue_loss_count, 1)
         self.assertEqual(record.streams[1].timing_queue_loss_count, 0)
 
+    def test_bridge_accepts_coordinator_started_by_safe_factory_without_double_start(self) -> None:
+        coordinator = self.make_coordinator(duration=1.0)
+        coordinator.start()
+        bridge = self.make_bridge(coordinator)
+        worker_a, worker_b = FakeTimingWorker(), FakeTimingWorker()
+        report = bridge.start_recording({"A": worker_a, "B": worker_b})
+        self.assertTrue(report.fully_started)
+        self.assertEqual(coordinator.snapshot().state, CoordinatorState.RUNNING)
+        worker_a.emit_frame(self.clock.value + 100_000_000)
+        worker_b.emit_frame(self.clock.value + 100_000_000)
+        self.clock.set(self.clock.value + 2_000_000_000)
+        record = bridge.stop_recording(reason_code="requested_duration_elapsed")
+        self.assertEqual(record.status, GroupStatus.COMPLETED)
+
     def test_v2_startup_remains_v2_and_grouped_repository_cannot_use_it(self) -> None:
         path = Path(self.tempdir.name) / "ordinary-synthetic-v2.sqlite3"
         database = Database(path)

@@ -319,7 +319,11 @@ class GroupedCaptureRecordingBridge:
                 raise CaptureAdapterError("grouped recording can only be started once")
             self._state = BridgeState.STARTING
         try:
-            self.coordinator.start()
+            coordinator_state = self.coordinator.snapshot().state
+            if coordinator_state is CoordinatorState.CREATED:
+                self.coordinator.start()
+            elif coordinator_state is not CoordinatorState.RUNNING:
+                raise CaptureAdapterError("grouped coordinator is not available for stream attachment")
         except Exception:
             with self._lock:
                 self._state = BridgeState.FAILED

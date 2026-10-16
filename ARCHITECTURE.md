@@ -150,7 +150,7 @@ The harness's GUI owns only widgets and queued requests. An owned `QThread` work
 
 Recording startup uses `GroupedRecordingCoordinator.create_and_start()` so the shared inode lease is acquired before group rows are inserted. `GroupedCaptureRecordingBridge` accepts that already-running coordinator as well as the prior created coordinator state, then attaches the two active fake sources. Stop Recording finalizes timing and leaves those fake sources active. Shutdown defers window close until source threads and the coordinator writer are closed; an unconfirmed result is displayed as unresolved and is never called Completed. The temporary database is removed only after safe shutdown and confirmed finalization; unresolved finalized-writer artifacts are retained for inspection.
 
-This is not a production Record Both feature. `Database.initialize()` remains on schema v2, real camera workers are not wired to grouped recording, and grouped History/Analysis work remains future work.
+This is not a production Record Both feature. `Database.initialize()` remains on schema v2 and real camera workers are not wired to grouped recording. Grouped History/Analysis was not implemented in Pass 2C.1; the later synthetic-only viewer is documented below.
 
 ## CEL-013 Pass 2D.1 — synthetic grouped History and Analysis
 

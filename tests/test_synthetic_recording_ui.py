@@ -884,14 +884,24 @@ class SyntheticRecordingUiTests(unittest.TestCase):
             GroupedExperimentRepository, "record_stream_measurements", autospec=True, side_effect=blocked_write
         ):
             with patch("camera_exploration_lab.ui.synthetic_recording_harness.SHUTDOWN_UNRESOLVED_WARNING_SECONDS", 0.05):
-                self.sources["A"].emit_frame(time.monotonic_ns())
-                self.assertTrue(entered.wait(2.0))
-                window.close()
-                self.assertTrue(wait_until(lambda: "deadline exceeded" in window.state_label.text().lower(), 2.5))
-                self.assertFalse(window._close_complete)
-                self.assertTrue(self.sources["A"]._stop.is_set() or self.sources["B"]._stop.is_set())
-                release.set()
+                try:
+                    self.sources["A"].emit_frame(time.monotonic_ns())
+                    self.assertTrue(entered.wait(2.0), "writer did not acknowledge the blocked transaction")
+                    window.close()
+                    self.assertTrue(wait_until(
+                        lambda: "deadline exceeded" in window.state_label.text().lower(),
+                        2.5,
+                    ))
+                    self.assertFalse(window._close_complete)
+                    self.assertTrue(self.sources["A"]._stop.is_set() or self.sources["B"]._stop.is_set())
+                finally:
+                    # Always release the injected writer, including on an
+                    # assertion failure, so unittest teardown cannot strand
+                    # its non-daemon worker behind the test fixture's own gate.
+                    release.set()
+
                 self.assertTrue(wait_until(lambda: window._close_complete, 5.0))
+                self.assertIsNotNone(window._worker._final_record)
         self.assertFalse(window._thread.isRunning())
 
     def test_lease_acquisition_failure_does_not_create_or_claim_a_recording(self) -> None:

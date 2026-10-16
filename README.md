@@ -124,7 +124,7 @@ For host visual review, check the timeline units and displayed interval count ag
 
 The Multi-Camera tab supports two independent V4L2 live streams. It enumerates capture formats, sizes, and advertised frame intervals using read-only V4L2 ioctls; only reported options appear. The driver readback is shown separately from the request, and delivered capture FPS can be lower than the requested value. Each stream has its own start/stop controls, capture worker, latest-frame slot, preview rate, frame count, failures, and elapsed host time. Start Both waits for both streams to confirm independently and reports partial startup if only one succeeds.
 
-The two streams share one user action but are not hardware-synchronized. Host frame arrival does not establish sensor exposure timing or absolute latency. Preview rendering runs at the GUI refresh cadence and can skip captured frames. Pass 1 does not record grouped experiments; use Single Camera Workbench for recording. CEL-013 Pass 2 will define grouped timing provenance and persistence.
+The two streams share one user action but are not hardware-synchronized. Host frame arrival does not establish sensor exposure timing or absolute latency. Preview rendering runs at the GUI refresh cadence and can skip captured frames. Pass 1 does not record grouped experiments; use Single Camera Workbench for recording. CEL-013's grouped schema and synthetic recording workflow are under development, but normal startup remains schema v2 and the production GUI has no grouped recording control.
 
 ## Tests
 
@@ -148,6 +148,8 @@ QT_QPA_PLATFORM=xcb \
 ```
 
 Check the in-window synthetic-only acknowledgement, start the fake streams, record or finish a group, choose **Inspect Synthetic Experiment**, then choose **Open in Grouped Analysis**. The harness uses only its own temporary database, refuses database-path arguments, and removes that database on clean shutdown. See [Grouped History and Analysis](docs/GROUPED_HISTORY_ANALYSIS.md) for measurement definitions and limitations.
+
+Schema-v3 compatibility and backup/migration rehearsal remain development-only. Normal `celab gui` continues to use schema v2 and rejects v3; no production migration or grouped recording activation is available. For an isolated synthetic migration and read-compatibility rehearsal, use the no-path commands in [Schema-v3 Readiness](docs/SCHEMA_V3_READINESS.md). They create, verify, and remove synthetic databases under temporary directories and do not select the configured application history file.
 
 Physical verification must run in a Bazzite KDE host session, since a container or sandbox may not have access to `/dev/video*`:
 

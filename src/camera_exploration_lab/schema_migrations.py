@@ -554,6 +554,30 @@ def _reject_partial_v3(connection: sqlite3.Connection) -> None:
         raise SchemaMigrationError("version 2 schema contains partial version 3 objects")
 
 
+def validate_schema_structure(
+    connection: sqlite3.Connection,
+    *,
+    expected_version: int | None = None,
+) -> int:
+    """Validate a supported v2/v3 layout without migrating or writing it.
+
+    This read-only validator is shared by development compatibility checks and
+    synthetic rehearsal tooling. It deliberately does not activate v3 in the
+    application startup path and does not require a synthetic application ID.
+    """
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if expected_version is not None and version != expected_version:
+        raise SchemaMigrationError("database schema version changed during validation")
+    if version == SCHEMA_VERSION:
+        _validate_v2(connection)
+        _reject_partial_v3(connection)
+    elif version == GROUPED_SCHEMA_VERSION:
+        _validate_v3(connection)
+    else:
+        raise SchemaMigrationError(f"unsupported database schema version {version}")
+    return version
+
+
 def migrate_synthetic_database_to_v3(
     database: Database,
     *,

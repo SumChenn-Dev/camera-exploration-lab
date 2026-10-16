@@ -166,3 +166,22 @@ PYTHONPATH=src "$VENV/bin/python" tools/run_synthetic_recording_ui.py \
 ```
 
 This command is for a Bazzite desktop session; it does not set the offscreen Qt platform. The tool requires both flags and then an in-window acknowledgement. It accepts no database path, makes a fresh disposable database only after **Record Both**, and never discovers or opens hardware. Choose Camera A's synthetic 100/187 event rate, Camera B's 24/30 rate, and a 1/5/10 second target; then use **Start Both**, **Record Both**, and **Stop Recording** or wait for the synthetic target. Stop Recording leaves fake streams running. **Inspect Synthetic Experiment** reads the group before close. **Stop Both** finalizes active timing before stopping producers. Closing waits asynchronously for safe teardown. These are synthetic UI and SQLite results, not camera measurements. For camera-free offscreen verification, set `QT_QPA_PLATFORM=offscreen` and run the full unittest command above. Production `celab gui` still has no grouped Record Both control or schema-v3 activation.
+
+## CEL-013 Pass 2E.1 synthetic migration rehearsal
+
+The readiness utility creates its own fresh synthetic v2 fixture and accepts no database-path argument. It requires both acknowledgements, backs up with SQLite's online backup API, migrates a separate synthetic copy, injects rollback failures, and removes all temporary databases on exit:
+
+```bash
+cd "$CHECKOUT"
+PYTHONPATH=src "$VENV/bin/python" tools/schema_v3_rehearsal.py \
+  --synthetic-only --acknowledge-synthetic-only
+```
+
+The related scaling benchmark also accepts no path and uses disposable synthetic databases. It runs six cases (30 s, 5 min, 30 min at 100+24 and 187+30 events/s) and can take tens of seconds because the 30-minute cases persist hundreds of thousands of rows:
+
+```bash
+PYTHONPATH=src "$VENV/bin/python" tools/benchmark_schema_v3_readiness.py \
+  --synthetic-only --acknowledge-synthetic-only
+```
+
+These commands test SQLite and application behavior only. They do not measure camera capture, alter the configured application database, enable v3 in the GUI, or persist their fixtures after the process exits. Fsync checks on temporary output do not establish power-loss durability. Never add generated database or backup files to Git. Production migration and backup require a separate review and explicit approval.

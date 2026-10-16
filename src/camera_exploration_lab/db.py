@@ -757,8 +757,18 @@ class Database:
     def history_entries(self) -> list[dict[str, object]]:
         """List history through a query-only connection; filtering never writes data."""
         with self.connect_readonly() as connection:
-            rows = connection.execute(
-                """SELECT s.id AS session_id, b.id AS benchmark_id, s.label AS session_label,
+            return self.history_entries_snapshot(connection)
+
+    @staticmethod
+    def history_entries_snapshot(
+        connection: sqlite3.Connection,
+    ) -> list[dict[str, object]]:
+        """Read ordinary session/run rows from a caller's query-only snapshot."""
+        query_only = connection.execute("PRAGMA query_only").fetchone()
+        if query_only is None or int(query_only[0]) != 1:
+            raise RuntimeError("history snapshots require a query-only connection")
+        rows = connection.execute(
+            """SELECT s.id AS session_id, b.id AS benchmark_id, s.label AS session_label,
                           s.source, s.started_at AS session_started_at, s.ended_at AS session_ended_at,
                           s.notes, s.metadata_json AS session_metadata_json,
                           b.label AS benchmark_label, b.started_at AS benchmark_started_at,
@@ -783,7 +793,7 @@ class Database:
                    LEFT JOIN import_sources i ON i.session_id=s.id
                    LEFT JOIN benchmark_summaries z ON z.benchmark_id=b.id
                    ORDER BY COALESCE(b.started_at, s.started_at, s.created_at) DESC, b.id"""
-            ).fetchall()
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def history_detail(self, benchmark_id: str | None, session_id: str) -> dict[str, object]:

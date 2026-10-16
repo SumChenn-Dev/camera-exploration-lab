@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -89,6 +90,7 @@ class SyntheticStreamView:
 @dataclass(frozen=True, slots=True)
 class SyntheticHarnessView:
     operation: str
+    capture_status_message: str
     recording_state: str
     session_id: str | None
     elapsed_seconds: float
@@ -480,6 +482,22 @@ class _SyntheticRecordingWorker(QObject):
             group = self._repository.get_group(self._session_id)
             if group is None:
                 raise RuntimeError("synthetic grouped experiment was not found")
+            if self._database is None:
+                raise RuntimeError("synthetic database is unavailable for read-only inspection")
+            # The persisted sample index is a zero-based sequence number, not a
+            # row count. Count the committed capture timing records directly so
+            # one frame (index 0) is reported as one persisted sample. This
+            # query stays read-only and includes both arrivals and read failures.
+            with self._database.connect_readonly() as connection:
+                persisted_counts = {
+                    stream.benchmark_id: int(connection.execute(
+                        """SELECT COUNT(*) FROM measurements
+                           WHERE benchmark_id=? AND stream_scope='capture'
+                             AND metric IN ('frame_arrival', 'read_failure')""",
+                        (stream.benchmark_id,),
+                    ).fetchone()[0])
+                    for stream in group.streams
+                }
             detail = {
                 "session_id": group.session_id,
                 "label": group.label,
@@ -493,7 +511,8 @@ class _SyntheticRecordingWorker(QObject):
                     "status": stream.stream_status,
                     "frames": stream.capture_frame_count,
                     "failures": stream.read_failure_count,
-                    "persisted_samples": stream.last_persisted_sample_index or 0,
+                    "persisted_samples": persisted_counts[stream.benchmark_id],
+                    "last_persisted_sample_index": stream.last_persisted_sample_index,
                     "data_complete": stream.data_complete,
                 } for stream in group.streams),
             }
@@ -774,8 +793,41 @@ class _SyntheticRecordingWorker(QObject):
             elif bridge_state is BridgeState.STARTING:
                 recording_state = "Starting; awaiting stream acknowledgements"
                 writer_status = "Starting"
+        active_capture_slots = [
+            stream.slot for stream in stream_views
+            if stream.capture_state in {"starting", "running", "stopping"}
+        ]
+        if not active_capture_slots:
+            capture_status_message = "Synthetic capture is stopped."
+        elif self._finalization_unconfirmed or recording_state.startswith("Failed"):
+            capture_status_message = (
+                "Recording finalization is unconfirmed; the experiment is not reported as saved. "
+                "Synthetic capture is still running; use Stop Both to stop the sources."
+            )
+        elif self._bridge is not None and self._bridge.snapshot()[0] is BridgeState.FINALIZED:
+            record = self._final_record or getattr(self._bridge, "_final_record", None)
+            if record is not None and str(record.status) == "completed" and record.data_complete:
+                capture_status_message = (
+                    "Recording completed and saved. Synthetic capture is still running; "
+                    "use Stop Both to stop the sources."
+                )
+            else:
+                status = str(record.status) if record is not None else "unconfirmed"
+                capture_status_message = (
+                    f"Recording finalized as {status}. Synthetic capture is still running; "
+                    "use Stop Both to stop the sources."
+                )
+        elif recording_state.startswith("Recording"):
+            capture_status_message = (
+                "Live capture continues independently; only timing samples accepted during this recording are saved."
+            )
+        else:
+            capture_status_message = (
+                "Synthetic capture is running. Events are counted live; they are not saved unless a recording is active."
+            )
         view = SyntheticHarnessView(
             operation=self._operation,
+            capture_status_message=capture_status_message,
             recording_state=recording_state,
             session_id=self._session_id,
             elapsed_seconds=elapsed_seconds,
@@ -816,37 +868,50 @@ class _SyntheticStreamPanel(QGroupBox):
             f"SYNTHETIC STREAM {slot}\nTiming events only\nNo camera opened · no images created"
         )
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumHeight(112)
+        self.preview.setMinimumHeight(96)
         self.preview.setStyleSheet(
             "QLabel { background: palette(base); color: palette(text); border: 1px solid palette(mid); }"
         )
-        self.state_label = QLabel("Stopped")
+        self.state_label = QLabel("Capture: stopped")
         self.state_label.setStyleSheet("color: palette(text); font-weight: 600;")
         layout.addWidget(self.preview, 1)
         layout.addWidget(self.state_label)
         self.metric_labels: dict[str, QLabel] = {}
-        grid = QGridLayout()
+        self.metric_title_labels: list[QLabel] = []
+        metric_content = QWidget(self)
+        grid = QGridLayout(metric_content)
+        grid.setContentsMargins(4, 2, 4, 2)
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
         for row, (key, title) in enumerate((
-            ("mode", "Synthetic mode"),
+            ("mode", "Synthetic capture mode"),
             ("fps", "Simulated capture events/s"),
-            ("frames", "Captured synthetic events"),
-            ("failures", "Injected read failures"),
+            ("frames", "Live capture events since Start Both"),
+            ("failures", "Live read failures since Start Both"),
             ("recording", "Recording stream state"),
-            ("accepted", "Accepted timing samples"),
-            ("persisted", "Persisted timing samples"),
-            ("rejected", "Queue rejections"),
-            ("persistence_losses", "Uncommitted persistence losses"),
-            ("queue", "Bounded queue depth / capacity"),
+            ("accepted", "Timing samples accepted during recording"),
+            ("persisted", "Timing samples committed to SQLite"),
+            ("rejected", "Timing samples rejected by bounded queue"),
+            ("persistence_losses", "Timing samples lost after writer failure"),
+            ("queue", "Recording queue depth / capacity"),
         )):
             label = QLabel(title)
             label.setStyleSheet("color: palette(text);")
+            label.setWordWrap(True)
             value = QLabel("—")
             value.setStyleSheet("color: palette(text); font-weight: 600;")
             value.setWordWrap(True)
             grid.addWidget(label, row, 0)
             grid.addWidget(value, row, 1)
+            self.metric_title_labels.append(label)
             self.metric_labels[key] = value
-        layout.addLayout(grid)
+        self.metrics_scroll_area = QScrollArea(self)
+        self.metrics_scroll_area.setWidgetResizable(True)
+        self.metrics_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.metrics_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.metrics_scroll_area.setMinimumHeight(72)
+        self.metrics_scroll_area.setWidget(metric_content)
+        layout.addWidget(self.metrics_scroll_area, 2)
 
     def update_view(self, view: SyntheticStreamView) -> None:
         self.state_label.setText(f"Capture: {view.capture_state}")
@@ -973,6 +1038,10 @@ class SyntheticRecordingWindow(QWidget):
         self.state_label.setWordWrap(True)
         self.state_label.setStyleSheet("color: palette(text); font-weight: 600;")
         page.addWidget(self.state_label)
+        self.capture_status_label = QLabel("Synthetic capture is stopped.")
+        self.capture_status_label.setWordWrap(True)
+        self.capture_status_label.setStyleSheet("color: palette(text);")
+        page.addWidget(self.capture_status_label)
         header = QFormLayout()
         self.group_id_label = QLabel("—")
         self.group_id_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1040,6 +1109,7 @@ class SyntheticRecordingWindow(QWidget):
         self._latest_view = view
         if self._pending_action is None:
             self.state_label.setText(view.operation)
+        self.capture_status_label.setText(view.capture_status_message)
         self.group_id_label.setText(view.session_id or "—")
         self.elapsed_label.setText(f"{view.elapsed_seconds:.1f} s")
         self.writer_label.setText(view.writer_status)
@@ -1145,7 +1215,10 @@ class SyntheticRecordingWindow(QWidget):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        orientation = Qt.Orientation.Horizontal if self.width() >= 1120 else Qt.Orientation.Vertical
+        # Keep the three supported Bazzite desktop widths side by side. At
+        # genuinely narrow widths, stack the cards; their metrics remain
+        # accessible through each card's own vertical scroll area.
+        orientation = Qt.Orientation.Horizontal if self.width() >= 900 else Qt.Orientation.Vertical
         if self.splitter.orientation() != orientation:
             self.splitter.setOrientation(orientation)
 

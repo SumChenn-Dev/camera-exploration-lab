@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import shutil
 import sqlite3
 import threading
 import time
@@ -9,12 +10,13 @@ from contextlib import closing
 import unittest
 from unittest.mock import patch
 
-from PySide6.QtCore import QEventLoop, Qt, QTimer
+from PySide6.QtCore import QEventLoop, QPoint, Qt, QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication
 
 from camera_exploration_lab.capture import CaptureState
+from camera_exploration_lab.db import Database
 from camera_exploration_lab.capture_recording_adapter import GroupedRecordingPersistenceError
 from camera_exploration_lab.grouped_recording_coordinator import GroupedRecordingCoordinator
 from camera_exploration_lab.grouped_recording import GroupedExperimentRepository, RecordingLeaseBusyError
@@ -152,6 +154,15 @@ class SyntheticRecordingUiTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM group_recordings").fetchone()[0], 1)
         self.assertEqual(source_a.snapshot().state, CaptureState.RUNNING)
         self.assertEqual(source_b.snapshot().state, CaptureState.RUNNING)
+        self.assertIn("finalized as partial", window.capture_status_label.text().lower())
+        self.assertIn("capture is still running", window.capture_status_label.text().lower())
+        self.assertIn("stop both", window.capture_status_label.text().lower())
+        self.assertIn("live capture events since start both", " ".join(
+            label.text().lower() for label in window._stream_panels[0].metric_title_labels
+        ))
+        self.assertIn("timing samples committed to sqlite", " ".join(
+            label.text().lower() for label in window._stream_panels[0].metric_title_labels
+        ))
         database_path = window._worker._database.path
         with closing(sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True)) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
@@ -187,6 +198,92 @@ class SyntheticRecordingUiTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: window._close_complete))
         self.assertFalse(window._thread.isRunning())
 
+    def test_inspection_counts_one_and_two_frame_rows_not_zero_based_indexes(self) -> None:
+        window = self.make_window()
+        self.acknowledge_and_start(window)
+        self.assertEqual(self.sources["A"].mode.fps, 100)
+        self.assertEqual(self.sources["B"].mode.fps, 24)
+        window.record_both_button.click()
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and window._latest_view.recording_state.startswith("Recording")))
+        self.emit_samples(self.sources["A"], 1)
+        self.emit_samples(self.sources["B"], 2)
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and window._latest_view.streams[0].persisted_samples == 1
+                                   and window._latest_view.streams[1].persisted_samples == 2))
+        window.stop_recording_button.click()
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and window._latest_view.recording_state == "partial"))
+        group_id = window._latest_view.session_id
+        database_path = window._worker._database.path
+        with closing(sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True)) as connection:
+            rows = connection.execute(
+                """SELECT bs.slot, bs.last_persisted_sample_index, COUNT(m.id)
+                   FROM benchmark_streams bs
+                   LEFT JOIN measurements m ON m.benchmark_id=bs.benchmark_id
+                       AND m.stream_scope='capture'
+                       AND m.metric IN ('frame_arrival', 'read_failure')
+                   WHERE bs.session_id=? GROUP BY bs.slot ORDER BY bs.slot""",
+                (group_id,),
+            ).fetchall()
+        self.assertEqual([(row[0], row[1], row[2]) for row in rows], [("A", 0, 1), ("B", 1, 2)])
+        inspection_results = []
+        window._worker.action_finished.connect(
+            lambda action, result: inspection_results.append(result) if action == "inspect" else None
+        )
+        window.inspect_button.click()
+        self.assertTrue(wait_until(lambda: bool(inspection_results)))
+        inspected = {item["slot"]: item for item in inspection_results[-1]["streams"]}
+        self.assertEqual(inspected["A"]["persisted_samples"], 1)
+        self.assertEqual(inspected["B"]["persisted_samples"], 2)
+        self.assertEqual(inspected["A"]["last_persisted_sample_index"], 0)
+        self.assertEqual(inspected["B"]["last_persisted_sample_index"], 1)
+        self.assertEqual(window._latest_view.streams[0].persisted_samples, 1)
+        self.assertEqual(window._latest_view.streams[1].persisted_samples, 2)
+        window.close()
+        self.assertTrue(wait_until(lambda: window._close_complete))
+
+    def test_inspection_reports_995_and_242_rows_not_last_zero_based_indexes(self) -> None:
+        window = self.make_window()
+        self.acknowledge_and_start(window)
+        window.record_both_button.click()
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and window._latest_view.recording_state.startswith("Recording")))
+        self.emit_samples(self.sources["A"], 995)
+        self.emit_samples(self.sources["B"], 242)
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and window._latest_view.streams[0].persisted_samples == 995
+                                   and window._latest_view.streams[1].persisted_samples == 242, 8.0))
+        window.stop_recording_button.click()
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and window._latest_view.recording_state == "partial", 8.0))
+        group_id = window._latest_view.session_id
+        database_path = window._worker._database.path
+        with closing(sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True)) as connection:
+            rows = connection.execute(
+                """SELECT bs.slot, bs.last_persisted_sample_index, COUNT(m.id)
+                   FROM benchmark_streams bs
+                   LEFT JOIN measurements m ON m.benchmark_id=bs.benchmark_id
+                       AND m.stream_scope='capture'
+                       AND m.metric IN ('frame_arrival', 'read_failure')
+                   WHERE bs.session_id=? GROUP BY bs.slot ORDER BY bs.slot""",
+                (group_id,),
+            ).fetchall()
+        self.assertEqual([(row[0], row[1], row[2]) for row in rows], [("A", 994, 995), ("B", 241, 242)])
+        inspection_results = []
+        window._worker.action_finished.connect(
+            lambda action, result: inspection_results.append(result) if action == "inspect" else None
+        )
+        window.inspect_button.click()
+        self.assertTrue(wait_until(lambda: bool(inspection_results)))
+        inspected_counts = tuple(item["persisted_samples"] for item in inspection_results[-1]["streams"])
+        self.assertEqual(inspected_counts, (995, 242))
+        self.assertEqual(tuple(stream.persisted_samples for stream in window._latest_view.streams), (995, 242))
+        self.assertIn("995 persisted", window.inspection_label.text())
+        self.assertIn("242 persisted", window.inspection_label.text())
+        window.close()
+        self.assertTrue(wait_until(lambda: window._close_complete))
+
     def test_duration_target_reports_completed_only_after_committed_finalization(self) -> None:
         window = self.make_window(auto_emit=True)
         window.acknowledgement.setChecked(True)
@@ -199,10 +296,32 @@ class SyntheticRecordingUiTests(unittest.TestCase):
                                    and window._latest_view.recording_state == "completed", timeout=4.0))
         self.assertIn("finalization committed", window.state_label.text().lower())
         self.assertEqual(window._latest_view.writer_status, "Final transaction committed")
-        self.assertGreater(window._latest_view.streams[0].persisted_samples, 0)
-        self.assertGreater(window._latest_view.streams[1].persisted_samples, 0)
-        self.assertGreater(window._latest_view.streams[0].frame_count,
-                           window._latest_view.streams[1].frame_count)
+        self.assertIn(
+            "Recording completed and saved. Synthetic capture is still running; use Stop Both to stop the sources.",
+            window.capture_status_label.text(),
+        )
+        persisted_at_finalization = tuple(stream.persisted_samples for stream in window._latest_view.streams)
+        frames_at_finalization = tuple(stream.frame_count for stream in window._latest_view.streams)
+        self.assertGreater(persisted_at_finalization[0], 0)
+        self.assertGreater(persisted_at_finalization[1], 0)
+        self.assertGreater(frames_at_finalization[0], frames_at_finalization[1])
+        self.assertTrue(wait_until(lambda: all(
+            stream.frame_count > frames_at_finalization[index]
+            for index, stream in enumerate(window._latest_view.streams)
+        ), 2.0))
+        self.assertEqual(
+            tuple(stream.persisted_samples for stream in window._latest_view.streams),
+            persisted_at_finalization,
+            "finalized recording counters must stay fixed while live capture continues",
+        )
+        inspection_results = []
+        window._worker.action_finished.connect(
+            lambda action, result: inspection_results.append(result) if action == "inspect" else None
+        )
+        window.inspect_button.click()
+        self.assertTrue(wait_until(lambda: bool(inspection_results)))
+        inspected_counts = tuple(item["persisted_samples"] for item in inspection_results[-1]["streams"])
+        self.assertEqual(inspected_counts, persisted_at_finalization)
         window.close()
         self.assertTrue(wait_until(lambda: window._close_complete))
 
@@ -339,16 +458,24 @@ class SyntheticRecordingUiTests(unittest.TestCase):
         window.close()
         self.assertTrue(wait_until(lambda: window._close_complete))
 
-    def test_responsive_splitter_adapts_to_requested_window_widths(self) -> None:
+    def test_responsive_layout_keeps_all_stream_metrics_reachable_at_desktop_sizes(self) -> None:
         window = self.make_window()
-        for width, orientation in (
-            (1024, Qt.Orientation.Vertical),
-            (1366, Qt.Orientation.Horizontal),
-            (1920, Qt.Orientation.Horizontal),
-        ):
+        for width in (1024, 1366, 1920):
             window.resize(width, 768)
             APP.processEvents()
-            self.assertEqual(window.splitter.orientation(), orientation)
+            self.assertEqual(window.size().width(), width)
+            self.assertEqual(window.size().height(), 768)
+            self.assertEqual(window.splitter.orientation(), Qt.Orientation.Horizontal)
+            for panel in window._stream_panels:
+                scroll = panel.metrics_scroll_area
+                self.assertGreater(scroll.viewport().width(), 0)
+                self.assertGreater(scroll.viewport().height(), 0)
+                for label in (*panel.metric_title_labels, *panel.metric_labels.values()):
+                    scroll.ensureWidgetVisible(label)
+                    APP.processEvents()
+                    top_left = label.mapTo(scroll.viewport(), QPoint(0, 0))
+                    self.assertGreaterEqual(top_left.y(), 0)
+                    self.assertLessEqual(top_left.y() + label.height(), scroll.viewport().height())
         window.close()
         self.assertTrue(wait_until(lambda: window._close_complete))
 
@@ -364,7 +491,12 @@ class SyntheticRecordingUiTests(unittest.TestCase):
                 palette.setColor(role, foreground)
             window.setPalette(palette)
             APP.processEvents()
-            for label in (window.state_label, window.group_id_label, window._stream_panels[0].state_label):
+            for label in (
+                window.state_label, window.capture_status_label, window.group_id_label,
+                window._stream_panels[0].state_label,
+                *window._stream_panels[0].metric_title_labels,
+                *window._stream_panels[0].metric_labels.values(),
+            ):
                 self.assertIn("palette(text)", label.styleSheet())
             self.assertGreaterEqual(
                 contrast_ratio_for_test(foreground, background), 4.5
@@ -404,20 +536,47 @@ class SyntheticRecordingUiTests(unittest.TestCase):
         window.close()
         self.assertTrue(wait_until(lambda: window._close_complete))
 
-    def test_close_during_recording_cancels_as_interrupted_and_tears_down_threads(self) -> None:
+    def test_close_during_recording_cancels_as_interrupted_and_preserves_inspectable_counts(self) -> None:
         window = self.make_window()
         self.acknowledge_and_start(window)
         window.record_both_button.click()
         self.assertTrue(wait_until(lambda: window._latest_view is not None
                                    and window._latest_view.recording_state.startswith("Recording")))
-        window.close()
-        self.assertTrue(wait_until(lambda: window._close_complete, 4.0))
+        self.emit_samples(self.sources["A"], 1)
+        self.emit_samples(self.sources["B"], 2)
+        self.assertTrue(wait_until(lambda: window._latest_view is not None
+                                   and window._latest_view.streams[0].persisted_samples == 1
+                                   and window._latest_view.streams[1].persisted_samples == 2))
+        database_path = window._worker._database.path
+        with patch.object(window._worker, "_remove_synthetic_database", lambda: None):
+            window.close()
+            self.assertTrue(wait_until(lambda: window._close_complete, 4.0))
         self.assertFalse(window._thread.isRunning())
         self.assertTrue(all(not (source._thread and source._thread.is_alive()) for source in self.sources.values()))
         self.assertIsNotNone(window._worker._final_record)
         self.assertEqual(str(window._worker._final_record.status), "interrupted")
-        self.assertEqual(window._worker._final_record.streams[0].capture_frame_count, 0)
-        self.assertEqual(window._worker._final_record.streams[1].capture_frame_count, 0)
+        self.assertEqual(window._worker._final_record.streams[0].capture_frame_count, 1)
+        self.assertEqual(window._worker._final_record.streams[1].capture_frame_count, 2)
+        try:
+            read_only_database = Database(database_path)
+            with read_only_database.connect_readonly() as connection:
+                self.assertEqual(connection.execute("PRAGMA query_only").fetchone()[0], 1)
+                counts = connection.execute(
+                    """SELECT bs.slot, COUNT(m.id)
+                       FROM benchmark_streams bs
+                       LEFT JOIN measurements m ON m.benchmark_id=bs.benchmark_id
+                           AND m.stream_scope='capture'
+                           AND m.metric IN ('frame_arrival', 'read_failure')
+                       WHERE bs.session_id=? GROUP BY bs.slot ORDER BY bs.slot""",
+                    (window._worker._session_id,),
+                ).fetchall()
+                self.assertEqual([(row[0], row[1]) for row in counts], [("A", 1), ("B", 2)])
+                self.assertEqual(connection.execute(
+                    "SELECT status FROM group_recordings WHERE session_id=?",
+                    (window._worker._session_id,),
+                ).fetchone()[0], "interrupted")
+        finally:
+            shutil.rmtree(database_path.parent, ignore_errors=True)
 
     def test_writer_finalization_error_never_displays_completed(self) -> None:
         window = self.make_window()
@@ -482,6 +641,33 @@ class SyntheticRecordingUiTests(unittest.TestCase):
                                        and window._latest_view.recording_state == "partial", 8.0))
             self.assertTrue(any(stream.queue_rejections > 0 for stream in window._latest_view.streams))
             self.assertNotEqual(window._latest_view.recording_state, "completed")
+            database = window._worker._database
+            session_id = window._latest_view.session_id
+            self.assertIsNotNone(database)
+            with database.connect_readonly() as connection:
+                rows = connection.execute(
+                    """SELECT bs.slot, COUNT(m.id)
+                       FROM benchmark_streams bs
+                       LEFT JOIN measurements m ON m.benchmark_id=bs.benchmark_id
+                           AND m.stream_scope='capture'
+                           AND m.metric IN ('frame_arrival', 'read_failure')
+                       WHERE bs.session_id=? GROUP BY bs.slot ORDER BY bs.slot""",
+                    (session_id,),
+                ).fetchall()
+            self.assertEqual(
+                tuple(int(row[1]) for row in rows),
+                tuple(stream.persisted_samples for stream in window._latest_view.streams),
+            )
+            inspection_results = []
+            window._worker.action_finished.connect(
+                lambda action, result: inspection_results.append(result) if action == "inspect" else None
+            )
+            window.inspect_button.click()
+            self.assertTrue(wait_until(lambda: bool(inspection_results)))
+            self.assertEqual(
+                tuple(item["persisted_samples"] for item in inspection_results[-1]["streams"]),
+                tuple(int(row[1]) for row in rows),
+            )
         window.close()
         self.assertTrue(wait_until(lambda: window._close_complete, 4.0))
 

@@ -628,12 +628,23 @@ class SyntheticRecordingUiTests(unittest.TestCase):
     def test_responsive_layout_keeps_all_stream_metrics_reachable_at_desktop_sizes(self) -> None:
         window = self.make_window()
         for width in (1024, 1366, 1920):
+            self.assertLessEqual(
+                window.minimumSizeHint().width(), width,
+                f"minimum width {window.minimumSizeHint().width()} exceeds {width}",
+            )
             window.resize(width, 768)
             APP.processEvents()
             self.assertEqual(window.size().width(), width)
             self.assertEqual(window.size().height(), 768)
             self.assertTrue(window.keep_capture_running_checkbox.isVisible())
             self.assertGreater(window.keep_capture_running_checkbox.width(), 0)
+            for control in (
+                window.start_both_button, window.record_both_button,
+                window.stop_recording_button, window.stop_a_button,
+                window.stop_b_button, window.stop_both_button, window.inspect_button,
+            ):
+                self.assertTrue(control.isVisible(), control.text())
+                self.assertGreater(control.width(), 0, control.text())
             self.assertEqual(window.splitter.orientation(), Qt.Orientation.Horizontal)
             for panel in window._stream_panels:
                 scroll = panel.metrics_scroll_area

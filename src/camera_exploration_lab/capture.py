@@ -75,6 +75,7 @@ class CaptureSnapshot:
     frame_count: int = 0
     read_failures: int = 0
     message: str = ""
+    elapsed_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +87,28 @@ class CaptureTimingEvent:
     observed_at: str
     interval_ns: int | None = None
     capture_fps: float = 0.0
+
+
+class CaptureTimingSubscription:
+    """Exclusive, removable subscription to one worker's scalar timing events.
+
+    The worker retains one callback slot for backwards compatibility with the
+    single-camera recorder. A subscription owns that same slot until closed,
+    so a second recorder cannot silently replace or share the callback.
+    """
+
+    def __init__(self, worker: "OpenCVCaptureWorker", token: object) -> None:
+        self._worker = worker
+        self._token = token
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            self._closed = True
+        return self._worker._remove_timing_subscription(self._token)
 
 
 class LatestFrameBuffer:
@@ -209,8 +232,9 @@ class OpenCVCaptureWorker(threading.Thread):
         capture_factory: CaptureFactory | None = None,
         frame_buffer: LatestFrameBuffer | None = None,
         read_failure_limit: int = 10,
+        worker_label: str | None = None,
     ) -> None:
-        super().__init__(name=f"celab-capture-{mode.name}", daemon=True)
+        super().__init__(name=f"celab-capture-{worker_label or mode.name}", daemon=True)
         self.device = device
         self.mode = mode
         self.frame_buffer = frame_buffer or LatestFrameBuffer()
@@ -220,6 +244,7 @@ class OpenCVCaptureWorker(threading.Thread):
         self._snapshot_lock = threading.Lock()
         self._listener_lock = threading.Lock()
         self._timing_listener: Callable[[CaptureTimingEvent], None] | None = None
+        self._timing_subscription_token: object | None = None
         self._snapshot = CaptureSnapshot(
             state=CaptureState.STARTING,
             requested=mode,
@@ -240,9 +265,38 @@ class OpenCVCaptureWorker(threading.Thread):
         self,
         listener: Callable[[CaptureTimingEvent], None] | None,
     ) -> None:
-        """Attach a non-blocking timing sink while leaving preview handoff alone."""
+        """Set the legacy single-camera timing sink.
+
+        New integrations should use ``subscribe_timing_listener`` so their
+        callback can only clear the listener slot it owns.
+        """
         with self._listener_lock:
+            if self._timing_subscription_token is not None:
+                raise RuntimeError("the capture timing listener is owned by an active subscription")
             self._timing_listener = listener
+
+    def subscribe_timing_listener(
+        self,
+        listener: Callable[[CaptureTimingEvent], None],
+    ) -> CaptureTimingSubscription:
+        """Claim the worker's single timing callback slot with an owned token."""
+        if not callable(listener):
+            raise TypeError("timing listener must be callable")
+        token = object()
+        with self._listener_lock:
+            if self._timing_listener is not None:
+                raise RuntimeError("this capture worker already has a timing listener")
+            self._timing_listener = listener
+            self._timing_subscription_token = token
+        return CaptureTimingSubscription(self, token)
+
+    def _remove_timing_subscription(self, token: object) -> bool:
+        with self._listener_lock:
+            if token is not self._timing_subscription_token:
+                return False
+            self._timing_listener = None
+            self._timing_subscription_token = None
+            return True
 
     def _emit_timing(self, kind: str, monotonic_ns: int, *, interval_ns: int | None = None,
                      capture_fps: float = 0.0) -> None:
@@ -269,6 +323,7 @@ class OpenCVCaptureWorker(threading.Thread):
 
     def run(self) -> None:
         capture: CaptureLike | None = None
+        capture_started_ns: int | None = None
         try:
             capture = self._capture_factory(self.device)
             if not capture.isOpened():
@@ -281,7 +336,8 @@ class OpenCVCaptureWorker(threading.Thread):
                 capture.set(_CAP_PROP_FOURCC, float(fourcc))
             capture.set(_CAP_PROP_FRAME_WIDTH, float(self.mode.width))
             capture.set(_CAP_PROP_FRAME_HEIGHT, float(self.mode.height))
-            capture.set(_CAP_PROP_FPS, float(self.mode.fps))
+            if self.mode.fps is not None:
+                capture.set(_CAP_PROP_FPS, float(self.mode.fps))
 
             negotiated = NegotiatedSettings(
                 width=_reported_int(capture.get(_CAP_PROP_FRAME_WIDTH)),
@@ -289,10 +345,15 @@ class OpenCVCaptureWorker(threading.Thread):
                 fps=_reported_fps(capture.get(_CAP_PROP_FPS)),
                 pixel_format=_fourcc_text(capture.get(_CAP_PROP_FOURCC)),
             )
+            if self._stop_event.is_set():
+                self._update(state=CaptureState.STOPPING, message="Stopped during camera initialization.")
+                return
+            capture_started_ns = time.monotonic_ns()
             self._update(
                 state=CaptureState.RUNNING,
                 negotiated=negotiated,
                 message="Capturing; driver readback is shown separately from the request.",
+                elapsed_seconds=0.0,
             )
 
             frame_rate = RollingFrameRate()
@@ -307,7 +368,10 @@ class OpenCVCaptureWorker(threading.Thread):
                     consecutive_failures += 1
                     current = self.snapshot()
                     total_failures = current.read_failures + 1
-                    self._update(read_failures=total_failures)
+                    self._update(
+                        read_failures=total_failures,
+                        elapsed_seconds=(captured_ns - capture_started_ns) / 1_000_000_000,
+                    )
                     self._emit_timing(
                         "read_failure", captured_ns, capture_fps=current.capture_fps
                     )
@@ -347,10 +411,14 @@ class OpenCVCaptureWorker(threading.Thread):
                         capture_fps=capture_fps,
                         frame_interval_ms=frame_interval_ms,
                         frame_count=frame_count,
+                        elapsed_seconds=(now_ns - capture_started_ns) / 1_000_000_000,
                     )
                     last_snapshot_ns = now_ns
                 else:
-                    self._update(frame_count=frame_count, frame_interval_ms=frame_interval_ms)
+                    self._update(
+                        frame_count=frame_count, frame_interval_ms=frame_interval_ms,
+                        elapsed_seconds=(now_ns - capture_started_ns) / 1_000_000_000,
+                    )
 
         except Exception as exc:
             if isinstance(exc, RuntimeError) and str(exc).startswith("OpenCV is not installed"):
@@ -361,6 +429,8 @@ class OpenCVCaptureWorker(threading.Thread):
             if current.state not in (CaptureState.STOPPING, CaptureState.STOPPED):
                 self._update(state=CaptureState.FAILED, message=f"Capture failed: {exc}")
         finally:
+            if capture_started_ns is not None:
+                self._update(elapsed_seconds=max(0.0, (time.monotonic_ns() - capture_started_ns) / 1_000_000_000))
             if capture is not None:
                 try:
                     capture.release()

@@ -12,6 +12,7 @@ from camera_exploration_lab.capture_modes import CaptureMode
 from camera_exploration_lab.db import Database
 from camera_exploration_lab.models import BackendKind, CameraIdentity
 from camera_exploration_lab.recording import ExperimentRecorder, RecordingState
+from camera_exploration_lab.recording_ownership import RecoveryClassification
 
 
 class FakeClock:
@@ -44,10 +45,10 @@ class SlowDatabase(Database):
         self.write_entered = threading.Event()
         self.release_write = threading.Event()
 
-    def record_measurements_batch(self, samples):
+    def record_measurements_batch(self, samples, *, ownership=None):
         self.write_entered.set()
         self.release_write.wait(timeout=2)
-        return super().record_measurements_batch(samples)
+        return super().record_measurements_batch(samples, ownership=ownership)
 
 
 def camera_identity() -> CameraIdentity:
@@ -232,6 +233,15 @@ class ExperimentRecorderTests(unittest.TestCase):
         snapshot = recorder.stop("manual_stop")
         self.assertEqual(snapshot.state, RecordingState.INTERRUPTED)
         self.assertEqual(snapshot.reason, "timing_queue_overflow")
+        inspection = slow_db.inspect_recording_recovery()
+        finding = next(
+            item for item in inspection.findings if item.session_id == snapshot.session_id
+        )
+        self.assertEqual(
+            finding.classification,
+            RecoveryClassification.INCOMPLETE_PERSISTENCE_LOSS,
+        )
+        self.assertFalse(finding.missing_tail_size_known)
 
 
 if __name__ == "__main__":

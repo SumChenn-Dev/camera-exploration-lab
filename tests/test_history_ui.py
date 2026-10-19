@@ -15,6 +15,7 @@ try:
     from camera_exploration_lab.db import Database
     from camera_exploration_lab.models import BackendKind, BenchmarkRecord, CameraCandidate, CameraIdentity, MeasurementSample, SessionRecord, StreamScope
     from camera_exploration_lab.ui.live_workbench import LiveWorkbenchWindow
+    from camera_exploration_lab.ui.live_workbench import recording_readiness_message
 
     QT_AVAILABLE = True
 except ImportError:
@@ -88,9 +89,15 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.database = Database(Path(self.tempdir.name) / "ui-history.sqlite3")
         self.database.initialize()
+        self._windows: list[LiveWorkbenchWindow] = []
         self.application.processEvents()
 
     def tearDown(self) -> None:
+        for window in self._windows:
+            window.close()
+            window.history_workspace.pool.waitForDone()
+            window.analysis_workspace._pool.waitForDone()
+        self.application.processEvents()
         self.database.close()
         self.tempdir.cleanup()
 
@@ -103,6 +110,60 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             time.sleep(0.005)
         self.application.processEvents()
         return predicate()
+
+    def test_multi_camera_tab_preserves_single_workbench_history_and_analysis(self) -> None:
+        window = LiveWorkbenchWindow(SyntheticDiscovery(), self.database)
+        self._windows.append(window)
+        labels = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+        self.assertEqual(
+            labels,
+            ["Live Workbench", "Multi-Camera", "History", "Analysis", "Exports"],
+        )
+        self.assertIsNotNone(window.multi_camera_workspace)
+        self.assertEqual(window.history_workspace.database, self.database)
+
+    def test_recording_status_reports_missing_name_when_preview_is_ready(self) -> None:
+        window = LiveWorkbenchWindow(
+            SyntheticDiscovery(), self.database,
+            capture_factory=lambda _device: FakeCapture(),
+        )
+        self._windows.append(window)
+        window.camera_combo.setCurrentIndex(0)
+        window.start_capture()
+        self.assertTrue(self._process_until(
+            lambda: window._worker is not None
+            and window._worker.snapshot().state == CaptureState.RUNNING
+        ))
+        self.assertEqual(window.recording_status.text(), "Enter a short experiment name first.")
+        self.assertFalse(window.record_start_button.isEnabled())
+        window.experiment_name.setText("Synthetic status check")
+        self.assertEqual(
+            window.recording_status.text(),
+            "Ready to record; live preview will continue independently.",
+        )
+        self.assertTrue(window.record_start_button.isEnabled())
+        window.close()
+
+    def test_recording_status_helper_prioritizes_live_blocker(self) -> None:
+        self.assertEqual(
+            recording_readiness_message(
+                has_camera=True, has_mode=True, capture_ready=True, has_name=False,
+            ),
+            "Enter a short experiment name first.",
+        )
+        self.assertEqual(
+            recording_readiness_message(
+                has_camera=True, has_mode=True, capture_ready=False, has_name=True,
+            ),
+            "Start preview and wait for negotiated camera settings before recording.",
+        )
+        self.assertIn(
+            "initialization failed",
+            recording_readiness_message(
+                has_camera=True, has_mode=True, capture_ready=False, has_name=True,
+                capture_state=CaptureState.FAILED,
+            ).lower(),
+        )
 
     def test_preview_continues_during_recording_and_history_includes_imported_data(self) -> None:
         imported = SessionRecord(camera_id=None, label="Imported: ps-eye.csv", source="imported")
@@ -118,10 +179,11 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             self.database,
             capture_factory=lambda _device: fake_capture,
         )
+        self._windows.append(window)
         window.show()
         window.refresh_history()
-        self.assertEqual(window.history_table.rowCount(), 1)
-        self.assertIn("Imported: ps-eye.csv", window.history_details.toPlainText())
+        self.assertTrue(self._process_until(lambda: window.history_workspace.proxy.rowCount() == 1))
+        self.assertTrue(self._process_until(lambda: "Imported: ps-eye.csv" in window.history_details.toPlainText()))
 
         window.camera_combo.setCurrentIndex(0)
         window.experiment_name.setText("Synthetic preview independence")
@@ -145,8 +207,8 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
         self.assertTrue(window._worker.is_alive())
 
         window.stop_recording()
-        self.assertEqual(window.history_table.rowCount(), 2)
-        labels = [window.history_table.item(row, 0).text() for row in range(window.history_table.rowCount())]
+        self.assertTrue(self._process_until(lambda: window.history_workspace.proxy.rowCount() == 2))
+        labels = [window.history_workspace.proxy.index(row, 0).data() for row in range(window.history_workspace.proxy.rowCount())]
         self.assertTrue(any("Synthetic preview independence" in label for label in labels))
         with self.database.connect() as connection:
             live_run = connection.execute(
@@ -182,6 +244,7 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             SyntheticDiscovery(), self.database,
             capture_factory=lambda _device: fake_capture,
         )
+        self._windows.append(window)
         window.camera_combo.setCurrentIndex(0)
         window.experiment_name.setText("Mock disconnect")
         window.duration_combo.setCurrentIndex(window.duration_combo.count() - 1)
@@ -221,6 +284,7 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
             SyntheticDiscovery(), self.database,
             capture_factory=lambda _device: fake_capture,
         )
+        self._windows.append(window)
         window.camera_combo.setCurrentIndex(0)
         window.experiment_name.setText("Must not start")
         window.start_capture()
@@ -230,7 +294,65 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
         window.start_recording()
         self.assertEqual(self.database.count("sessions"), 0)
         self.assertEqual(self.database.count("benchmark_runs"), 0)
-        self.assertIn("Wait for camera", window.recording_status.text())
+        self.assertIn("initialization failed", window.recording_status.text().lower())
+        window.close()
+
+    def test_history_row_opens_the_same_run_in_analysis(self) -> None:
+        session = SessionRecord(
+            camera_id=None,
+            label="Imported navigation fixture",
+            source="imported",
+            started_at="2026-10-13T12:00:00+00:00",
+        )
+        self.database.create_session(session)
+        benchmark = BenchmarkRecord(
+            session_id=session.id,
+            label="Legacy 320x240",
+            status="imported",
+            configuration={"legacy_mode": "320x240"},
+        )
+        self.database.create_benchmark(benchmark)
+        self.database.record_measurements_batch([
+            MeasurementSample(
+                benchmark_id=benchmark.id,
+                metric="capture_frame_interval_ms",
+                value=8.0,
+                unit="ms",
+                stream_scope=StreamScope.CAPTURE,
+                sample_index=1,
+                method="legacy_csv:interval_ms",
+            ),
+            MeasurementSample(
+                benchmark_id=benchmark.id,
+                metric="capture_frame_interval_ms",
+                value=9.0,
+                unit="ms",
+                stream_scope=StreamScope.CAPTURE,
+                sample_index=2,
+                method="legacy_csv:interval_ms",
+            ),
+        ])
+        window = LiveWorkbenchWindow(SyntheticDiscovery(), self.database)
+        self._windows.append(window)
+        window.refresh_history()
+        self.assertTrue(self._process_until(lambda: window.history_workspace.proxy.rowCount() == 1))
+        window.history_table.selectRow(0)
+        window.analyze_history_button.click()
+
+        self.assertEqual(window.tabs.currentWidget(), window.analysis_workspace)
+        self.assertTrue(self._process_until(
+            lambda: window.analysis_workspace._primary is not None
+            and window.analysis_workspace._primary.option.session_id == session.id
+        ))
+        self.assertEqual(
+            window.analysis_workspace.experiment_combo.currentData(),
+            (session.id, benchmark.id),
+        )
+        self.assertEqual(
+            window.analysis_workspace._primary.interval_stats.count,
+            2,
+        )
+        self.assertEqual(len(window.analysis_workspace.interval_plot.plotItem.listDataItems()), 1)
         window.close()
 
 

@@ -190,16 +190,24 @@ class DatabaseTests(unittest.TestCase):
             camera_id=camera.stable_identifier,
             label="Crash interrupted run",
             started_at="2026-10-13T12:00:00+00:00",
+            source="live_experiment",
             metadata={"owner_pid": 2_000_000_000, "owner_process_start_ticks": "1"},
         )
-        benchmark = BenchmarkRecord(session_id=session.id, label="mock", started_at=session.started_at)
-        self.database.begin_live_experiment(camera, session, benchmark, [], seen_at=session.started_at)
-        self.database.record_measurement(
-            MeasurementSample(
-                benchmark.id, "frame_arrival", 0.5, "seconds", StreamScope.CAPTURE,
-                elapsed_seconds=0.5, sample_index=1,
-            )
+        benchmark = BenchmarkRecord(
+            session_id=session.id, label="mock", started_at=session.started_at, status="running"
         )
+        # Seed a synthetic crash residue directly. Normal live creation and
+        # writes now require an active database recording owner.
+        self.database.upsert_camera(camera, seen_at=session.started_at)
+        self.database.create_session(session)
+        self.database.create_benchmark(benchmark)
+        with self.database.connect() as connection:
+            self.database._insert_measurements(connection, [
+                MeasurementSample(
+                    benchmark.id, "frame_arrival", 0.5, "seconds", StreamScope.CAPTURE,
+                    elapsed_seconds=0.5, sample_index=1,
+                )
+            ])
 
         recovered = self.database.recover_interrupted_experiments(
             ended_at="2026-10-13T12:01:00+00:00"

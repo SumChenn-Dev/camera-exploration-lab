@@ -4,18 +4,25 @@ Camera Exploration Lab is an offline-first Linux desktop workbench for discoveri
 
 ## Current scope
 
-Phase 2A provides:
+The current application includes:
 
 - Read-only V4L2 discovery with `/dev/v4l/by-id` identity preferred when available.
 - A preview-first Live Workbench for V4L2 cameras, with the preview occupying about two thirds of the primary area and persistent capture/preview diagnostics beside it.
-- Camera selection and tested mode profiles for the Sony PlayStation Eye and AVerMedia Live Streamer CAM 313.
-- Independent camera capture and GUI preview loops. Capture can run faster than the screen refresh without building a frame queue.
+- Camera selection and tested single-camera mode profiles for the Sony PlayStation Eye and AVerMedia Live Streamer CAM 313.
+- A separate Multi-Camera tab with two independent V4L2 workers, mode choices enumerated from each device, independent status and metrics, and side-by-side or stacked previews.
+- Independent camera capture and GUI preview loops. Each dual preview reads from a one-frame overwrite slot, so 187 FPS capture does not require 187 GUI updates or create an unbounded queue.
 - Fixed duration and manual experiment recording, with requested settings, driver readback, notes, timestamps, summary statistics, and raw timing samples stored in SQLite.
-- A History tab for local experiment sessions and imported CSV measurements.
+- A searchable History tab for local experiment sessions and imported CSV measurements, with camera-family/source filters and stable Analyze-selected navigation.
+- An Analysis tab with camera/mode/requested-FPS filters, searchable Session A/B selection, summary cards, timing curves, interval distributions, and same-camera comparisons by default.
+- An integrated Metrics Guide available from Analysis and History, with plain-language definitions, units, labeled examples, interpretation guidance, common pitfalls, and measurement methods.
 
-Capture FPS, preview FPS, and future processing FPS are separate measurements. Frame arrival timestamps and intervals are host-side observations; they do not measure sensor-to-display latency. Raw video is not retained by the recorder.
+The Analysis tab can be opened from History with the Analyze selected button. It shows a compact experiment header and labeled cards for observed capture FPS, GUI preview FPS, processing FPS when recorded, frame count, interval percentiles, and read failures. The capture plots provide Fit to Data, Reset View, Zoom In/Out, mouse-drag panning, and Expand Plot/Restore Layout controls. At narrower window widths the capture-rate and interval plots stack vertically. The optional deviation axis uses 100 × (window rate − that session's mean) / that session's mean; zero represents the session mean. Open Metrics Guide or use a card's `?` help button for definitions and limitations. Expand Technical details for requested and driver-reported settings, timing methods, timestamp scope, duration source, and notes. Filters and search narrow Session A and B; a different recording from the same model family is selected by default when available. Use Swap A / B or Clear B to change the comparison. Camera-family browsing does not merge stored identities: identity-source labels and opaque fingerprints preserve their provenance.
 
-Detailed analysis graphs, exports, extensive camera controls, and Canon CHDKPTP support are future work. The core application is for camera research. Specialized computer-vision experiments will use optional extension packages with their own dependencies and processing metrics. Wardrobe inventory is a separate application and is outside this project.
+With two sessions selected, the Analysis tab overlays capture-FPS curves only when both have recorder elapsed timestamps. Different durations and sampling densities retain their own sample points; no interpolation or simultaneous-capture claim is made. The optional deviation view expresses each window relative to that session's observed mean and formats ticks as percentages. Session A and Session B use separate colors, line styles, and legend labels. Interval timelines can be shown or hidden independently and overlay only when timing scope and method match. Interval distributions use shared logarithmic bins for positive values; zero samples are reported separately because a log axis cannot display zero.
+
+Analysis distinguishes requested settings, driver readback, observed capture throughput, GUI preview cadence, and future processing throughput. Its FPS curve uses non-overlapping windows of recorded frame intervals (one second by default; longer windows for very long recordings). Imported or incomplete records may have summary-only values and are labeled accordingly. Frame-arrival timestamps are host observations after OpenCV returns; neither they nor frame intervals measure sensor exposure or sensor-to-display latency. Analysis opens SQLite read-only and does not change the local database. Raw video is not retained by the recorder.
+
+Multi-camera recording and its experiment/database model, exports, extensive camera controls, and Canon CHDKPTP support are future work. The core application is for camera research. Specialized computer-vision experiments will use optional extension packages with their own dependencies and processing metrics. Wardrobe inventory is a separate application and is outside this project.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the component boundaries and [docs/EXPLORATION_NOTEBOOK.md](docs/EXPLORATION_NOTEBOOK.md) for ongoing ideas, findings, and design decisions.
 The [development log](docs/DEVELOPMENT_LOG.md) summarizes completed milestones. See the [Konsole development workflow](docs/DEVELOPMENT_WORKFLOW.md) for tests, read-only release review, and deliberate GitHub publication. The [initial snapshot audit](docs/PUBLICATION_AUDIT.md) documents the separate one-time privacy check.
@@ -107,6 +114,18 @@ VENV="$HOME/.local/share/camera-exploration-lab/venv"
 
 The importer reads the source files without moving or editing them. Reimporting the same unchanged file is idempotent.
 
+## Search History and inspect experiments
+
+Launch Camera Exploration Lab through the KDE launcher, or use the existing virtual environment and the same database argument already configured in the launcher. History search covers experiment names, camera, source, notes, capture mode, requested FPS, date, and status where available. Camera-family and source filters can be combined; Clear filters resets them. Sorting and filtering do not edit stored records. Select a row and choose Analyze selected, or open Analysis and select a run directly. Choose a second run in Session B to see compatible elapsed-time curves, interval-distribution comparison, and the metric table.
+
+For host visual review, check the timeline units and displayed interval count against the selected run, compare capture and preview rates separately, and confirm that requested and driver-reported modes remain distinct. A raw interval plot may be unavailable for summary-only imports; those records show stored fields without reconstructing samples. History and Analysis use read-only connections for browsing and leave the existing history file in place. See [Related Projects](docs/RELATED_PROJECTS.md) for complementary tools and scope boundaries.
+
+## Multi-Camera live preview (CEL-013 Pass 1)
+
+The Multi-Camera tab supports two independent V4L2 live streams. It enumerates capture formats, sizes, and advertised frame intervals using read-only V4L2 ioctls; only reported options appear. The driver readback is shown separately from the request, and delivered capture FPS can be lower than the requested value. Each stream has its own start/stop controls, capture worker, latest-frame slot, preview rate, frame count, failures, and elapsed host time. Start Both waits for both streams to confirm independently and reports partial startup if only one succeeds.
+
+The two streams share one user action but are not hardware-synchronized. Host frame arrival does not establish sensor exposure timing or absolute latency. Preview rendering runs at the GUI refresh cadence and can skip captured frames. Pass 1 provides live preview only; use Single Camera Workbench for recording. The grouped schema, coordinator, and grouped History/Analysis are demonstrated only through the explicitly acknowledged fake-camera harness below. Normal startup remains schema v2, and the production GUI has no grouped Record Both control or production schema-v3 activation. The owner-validated dual preview does not validate grouped recording. Grouped video recording is unavailable, and CEL-014 Live Performance Monitor remains a design proposal rather than an implemented feature.
+
 ## Tests
 
 Tests use synthetic timings, generated CSVs, temporary SQLite databases, and mocked cameras. They do not require a connected camera:
@@ -116,6 +135,21 @@ cd "$HOME/Documents/Codex/Camera-Exploration-Lab-public-snapshot"
 VENV="$HOME/.local/share/camera-exploration-lab/venv"
 PYTHONPATH=src QT_QPA_PLATFORM=offscreen "$VENV/bin/python" -m unittest discover -v -s tests
 ```
+
+## Inspect a synthetic grouped experiment
+
+The schema-v3 grouped History/Analysis viewer is currently available only inside the explicitly acknowledged fake-camera harness. It does not change normal History or Analysis, which remain on schema v2. From the repository root on Bazzite:
+
+```bash
+QT_QPA_PLATFORM=xcb \
+  "$HOME/.local/share/camera-exploration-lab/venv/bin/python" \
+  tools/run_synthetic_recording_ui.py \
+  --synthetic-only --acknowledge-synthetic-only
+```
+
+Check the in-window synthetic-only acknowledgement, start the fake streams, record or finish a group, choose **Inspect Synthetic Experiment**, then choose **Open in Grouped Analysis**. The harness uses only its own temporary database, refuses database-path arguments, and removes that database on clean shutdown. **Keep synthetic capture running after recording finishes** is unchecked by default: natural fixed-duration completion commits the recording and then stops both fake sources. Checking it leaves synthetic capture running; manual early **Stop Recording** also leaves capture running. These synthetic flows do not validate real grouped recording. See [Grouped History and Analysis](docs/GROUPED_HISTORY_ANALYSIS.md) for measurement definitions and limitations.
+
+Schema-v3 compatibility and backup/migration rehearsal remain development-only. Normal `celab gui` continues to use schema v2 and rejects v3; no production migration or grouped recording activation is available. For an isolated synthetic migration and read-compatibility rehearsal, use the no-path commands in [Schema-v3 Readiness](docs/SCHEMA_V3_READINESS.md). They create, verify, and remove synthetic databases under temporary directories and do not select the configured application history file.
 
 Physical verification must run in a Bazzite KDE host session, since a container or sandbox may not have access to `/dev/video*`:
 
@@ -128,7 +162,7 @@ test -n "$DATABASE"
 "$VENV/bin/celab" --database "$DATABASE" gui
 ```
 
-In the Live Workbench, select a camera and mode, start preview, and check the driver-reported settings. Start a 10, 30, 60, or 120 second experiment and confirm that the preview continues while recording. Then inspect the result and any imported sessions in History. Do not treat read duration or frame interval as sensor latency.
+In the Live Workbench, select a camera and mode, start preview, and check the driver-reported settings. Camera discovery checks each node's effective V4L2 device capabilities, so metadata-only endpoints are omitted while genuine virtual capture devices remain eligible. Start a 10, 30, 60, or 120 second experiment and confirm that the preview continues while recording. Then inspect the result and any imported sessions in History. Do not treat read duration or frame interval as sensor latency.
 
 ## Contributing and license
 

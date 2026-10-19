@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import tempfile
+import struct
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from camera_exploration_lab.discovery import V4L2Discovery
 
@@ -34,11 +37,15 @@ class V4L2DiscoveryTests(unittest.TestCase):
             stable_link = by_id / "usb-MOCK-001-video-index0"
             stable_link.symlink_to(video_node)
 
-            cameras = V4L2Discovery(
-                dev_root=dev_root,
-                sysfs_root=sysfs_root,
-                by_id_root=by_id,
-            ).discover()
+            with patch(
+                "camera_exploration_lab.discovery._query_v4l2_capabilities",
+                return_value=(0xC4200001, 0x04200001),
+            ):
+                cameras = V4L2Discovery(
+                    dev_root=dev_root,
+                    sysfs_root=sysfs_root,
+                    by_id_root=by_id,
+                ).discover()
 
             self.assertEqual(len(cameras), 1)
             camera = cameras[0]
@@ -63,11 +70,15 @@ class V4L2DiscoveryTests(unittest.TestCase):
             (sysfs_entry / "device").symlink_to(device)
             (sysfs_entry / "name").write_text("Mock Video Node\n", encoding="utf-8")
 
-            camera = V4L2Discovery(
-                dev_root=root / "dev",
-                sysfs_root=sysfs_root,
-                by_id_root=root / "missing-by-id",
-            ).discover()[0]
+            with patch(
+                "camera_exploration_lab.discovery._query_v4l2_capabilities",
+                return_value=(0x04200001, 0x04200001),
+            ):
+                camera = V4L2Discovery(
+                    dev_root=root / "dev",
+                    sysfs_root=sysfs_root,
+                    by_id_root=root / "missing-by-id",
+                ).discover()[0]
 
             self.assertEqual(camera.identity.identity_source, "sysfs_path")
             self.assertIn("mock-video", camera.identity.stable_identifier)
@@ -96,11 +107,15 @@ class V4L2DiscoveryTests(unittest.TestCase):
                 (entry / "name").write_text("Mock AVerMedia\n", encoding="utf-8")
                 (entry / "index").write_text(index + "\n", encoding="utf-8")
 
-            cameras = V4L2Discovery(
-                dev_root=dev_root,
-                sysfs_root=sysfs_root,
-                by_id_root=root / "missing-by-id",
-            ).discover()
+            with patch(
+                "camera_exploration_lab.discovery._query_v4l2_capabilities",
+                return_value=(0x04200001, 0x04200001),
+            ):
+                cameras = V4L2Discovery(
+                    dev_root=dev_root,
+                    sysfs_root=sysfs_root,
+                    by_id_root=root / "missing-by-id",
+                ).discover()
 
             self.assertEqual(len(cameras), 2)
             self.assertNotEqual(cameras[0].identity.stable_identifier, cameras[1].identity.stable_identifier)
@@ -111,6 +126,101 @@ class V4L2DiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = V4L2Discovery(sysfs_root=Path(directory) / "absent").discover()
         self.assertEqual(result, [])
+
+    def test_device_caps_exclude_metadata_nodes_and_keep_virtual_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dev_root = root / "dev"
+            sysfs_root = root / "sys/class/video4linux"
+            usb_device = root / "sys/devices/usb1/mock-camera"
+            usb_device.mkdir(parents=True)
+            for node, name in (
+                ("video17", "Mock UVC Camera"),
+                ("video18", "Mock UVC Camera Metadata"),
+                ("video4", "OBS Virtual Camera"),
+            ):
+                entry = sysfs_root / node
+                entry.mkdir(parents=True)
+                device_node = dev_root / node
+                device_node.parent.mkdir(parents=True, exist_ok=True)
+                device_node.touch()
+                (entry / "name").write_text(name, encoding="utf-8")
+                (entry / "device").symlink_to(usb_device if node.startswith("video1") else entry)
+
+            broad_caps = 0x80000000 | 0x04200001 | 0x00800000
+            image_caps = 0x04200001
+            metadata_caps = 0x04A00000
+            queried = {
+                "video17": (broad_caps, image_caps),
+                "video18": (broad_caps, metadata_caps),
+                "video4": (0x04200001, 0x04200001),
+            }
+
+            def query(path: Path):
+                return queried[path.name]
+
+            with patch(
+                "camera_exploration_lab.discovery._query_v4l2_capabilities",
+                side_effect=query,
+            ):
+                cameras = V4L2Discovery(
+                    dev_root=dev_root,
+                    sysfs_root=sysfs_root,
+                    by_id_root=root / "missing-by-id",
+                ).discover()
+
+        paths = {Path(camera.identity.device_path).name for camera in cameras}
+        self.assertEqual(paths, {"video17", "video4"})
+        virtual = next(camera for camera in cameras if camera.display_name == "OBS Virtual Camera")
+        self.assertEqual(virtual.identity.backend.value, "v4l2")
+        self.assertEqual(virtual.identity.metadata["v4l2_device_caps"], 0x04200001)
+
+    def test_device_caps_query_uses_device_specific_mask_when_flag_is_set(self) -> None:
+        from camera_exploration_lab.discovery import (
+            _V4L2_CAP_DEVICE_CAPS,
+            _VIDIOC_QUERYCAP,
+            _V4L2_CAP_VIDEO_CAPTURE,
+            _query_v4l2_capabilities,
+            _supports_image_capture,
+        )
+
+        advertised = _V4L2_CAP_DEVICE_CAPS | 0x04200001 | 0x00800000
+        image_device_caps = 0x04200001
+        metadata_device_caps = 0x04A00000
+        self.assertTrue(_supports_image_capture(image_device_caps))
+        self.assertFalse(_supports_image_capture(metadata_device_caps))
+        self.assertTrue(advertised & _V4L2_CAP_DEVICE_CAPS)
+        self.assertTrue(image_device_caps & _V4L2_CAP_VIDEO_CAPTURE)
+
+        def ioctl(_fd: int, request: int, payload: bytearray, _mutate: bool) -> int:
+            self.assertEqual(request, _VIDIOC_QUERYCAP)
+            struct.pack_into("=II", payload, 84, advertised, metadata_device_caps)
+            return 0
+
+        def open_read_only(_path: Path, flags: int) -> int:
+            self.assertEqual(flags & (os.O_WRONLY | os.O_RDWR), 0)
+            return 123
+
+        with patch("camera_exploration_lab.discovery.os.open", side_effect=open_read_only), \
+                patch("camera_exploration_lab.discovery.os.close"), \
+                patch("camera_exploration_lab.discovery.fcntl.ioctl", side_effect=ioctl):
+            result = _query_v4l2_capabilities(Path("/dev/synthetic-node"))
+        self.assertEqual(result, (advertised, metadata_device_caps))
+        self.assertFalse(_supports_image_capture(result[1]))
+
+        advertised_without_device_flag = 0x04200001
+
+        def ioctl_without_device_flag(_fd: int, request: int, payload: bytearray, _mutate: bool) -> int:
+            self.assertEqual(request, _VIDIOC_QUERYCAP)
+            struct.pack_into("=II", payload, 84, advertised_without_device_flag, metadata_device_caps)
+            return 0
+
+        with patch("camera_exploration_lab.discovery.os.open", side_effect=open_read_only), \
+                patch("camera_exploration_lab.discovery.os.close"), \
+                patch("camera_exploration_lab.discovery.fcntl.ioctl", side_effect=ioctl_without_device_flag):
+            result = _query_v4l2_capabilities(Path("/dev/synthetic-virtual"))
+        self.assertEqual(result, (advertised_without_device_flag, advertised_without_device_flag))
+        self.assertTrue(_supports_image_capture(result[1]))
 
 
 if __name__ == "__main__":

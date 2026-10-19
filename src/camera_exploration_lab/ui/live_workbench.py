@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import json
 import time
 from typing import Any
 
@@ -11,7 +10,6 @@ from PySide6.QtCore import QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QAbstractItemView,
     QComboBox,
     QFormLayout,
     QFrame,
@@ -20,7 +18,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QHeaderView,
     QLineEdit,
     QPlainTextEdit,
     QProgressBar,
@@ -28,8 +25,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QTabWidget,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -40,8 +35,32 @@ from ..db import Database
 from ..discovery import V4L2Discovery
 from ..models import CameraCandidate, utc_now_iso
 from ..recording import ExperimentRecorder, RecordingSnapshot, RecordingState
+from .analysis_workspace import AnalysisWorkspace
+from .history_workspace import HistoryWorkspace
+from .multi_camera_workbench import MultiCameraWorkspace
+from .preview import frame_to_image
 
 logger = logging.getLogger(__name__)
+
+
+def recording_readiness_message(
+    *, has_camera: bool, has_mode: bool, capture_ready: bool, has_name: bool,
+    capture_state: CaptureState | None = None,
+) -> str:
+    """Return the current concrete blocker for starting a recording."""
+    if not has_camera or not has_mode:
+        return "Select a camera and capture mode before recording."
+    if not capture_ready:
+        if capture_state == CaptureState.FAILED:
+            return "Camera capture initialization failed; review the Live Workbench error before retrying."
+        if capture_state == CaptureState.UNAVAILABLE:
+            return "Camera is unavailable. Reconnect it or select another camera."
+        if capture_state == CaptureState.STARTING:
+            return "Wait for camera initialization and negotiated settings before recording."
+        return "Start preview and wait for negotiated camera settings before recording."
+    if not has_name:
+        return "Enter a short experiment name first."
+    return "Ready to record; live preview will continue independently."
 
 
 def _mode_for_combo(combo: QComboBox) -> CaptureMode | None:
@@ -52,38 +71,6 @@ def _mode_for_combo(combo: QComboBox) -> CaptureMode | None:
 def _candidate_for_combo(combo: QComboBox) -> CameraCandidate | None:
     candidate = combo.currentData(Qt.ItemDataRole.UserRole)
     return candidate if isinstance(candidate, CameraCandidate) else None
-
-
-def _frame_to_image(frame: Any) -> QImage:
-    """Wrap an OpenCV frame and copy its pixels before the buffer is reused."""
-    shape = getattr(frame, "shape", None)
-    if shape is None or len(shape) < 2:
-        raise ValueError("Camera returned a frame without image dimensions")
-    height, width = int(shape[0]), int(shape[1])
-    if height < 1 or width < 1:
-        raise ValueError("Camera returned an empty frame")
-
-    flags = getattr(frame, "flags", None)
-    if flags is not None and not flags.c_contiguous:
-        frame = frame.copy()
-    data = frame.data
-    strides = getattr(frame, "strides", None)
-    bytes_per_line = int(strides[0]) if strides else width * (int(shape[2]) if len(shape) > 2 else 1)
-
-    if len(shape) == 2:
-        image_format = QImage.Format.Format_Grayscale8
-    else:
-        channels = int(shape[2])
-        if channels == 3:
-            image_format = QImage.Format.Format_BGR888
-        elif channels == 4:
-            image_format = QImage.Format.Format_BGRA8888
-        else:
-            raise ValueError(f"Unsupported camera frame with {channels} channels")
-    image = QImage(data, width, height, bytes_per_line, image_format)
-    if image.isNull():
-        raise ValueError("Could not convert the camera frame for preview")
-    return image.copy()
 
 
 class MetricCard(QFrame):
@@ -140,10 +127,19 @@ class LiveWorkbenchWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self.tabs.addTab(self._build_live_tab(), "Live Workbench")
-        self.tabs.addTab(self._build_history_tab(), "History")
-        self.tabs.addTab(self._build_placeholder_tab(
-            "Live analysis", "Tracking, motion analysis, digital zoom, and image processing will be added here."
-        ), "Analysis")
+        self.multi_camera_workspace = MultiCameraWorkspace(
+            refresh_requested=self.refresh_cameras, capture_factory=self._capture_factory
+        )
+        self.tabs.addTab(self.multi_camera_workspace, "Multi-Camera")
+        self.history_workspace = HistoryWorkspace(self._database)
+        self.history_workspace.analyze_requested.connect(self._open_history_in_analysis)
+        self.history_table = self.history_workspace.history_table
+        self.history_details = self.history_workspace.history_details
+        self.history_refresh_button = self.history_workspace.refresh_button
+        self.analyze_history_button = self.history_workspace.analyze_button
+        self.tabs.addTab(self.history_workspace, "History")
+        self.analysis_workspace = AnalysisWorkspace(self._database)
+        self.tabs.addTab(self.analysis_workspace, "Analysis")
         self.tabs.addTab(self._build_placeholder_tab(
             "Exports", "Session summaries and raw CSV/JSON exports will be added here."
         ), "Exports")
@@ -304,7 +300,7 @@ class LiveWorkbenchWindow(QMainWindow):
         self.record_stop_button.clicked.connect(self.stop_recording)
         record_controls.addWidget(self.record_start_button)
         record_controls.addWidget(self.record_stop_button)
-        self.recording_status = QLabel("Preview must be running before recording can start.")
+        self.recording_status = QLabel("Select a camera and capture mode before recording.")
         self.recording_status.setWordWrap(True)
         self.recording_progress = QProgressBar()
         self.recording_progress.setRange(0, 1000)
@@ -317,7 +313,7 @@ class LiveWorkbenchWindow(QMainWindow):
         recording_layout.addWidget(self.recording_status)
         recording_layout.addWidget(self.recording_progress)
         diagnostics_layout.addWidget(recording_box)
-        self.experiment_name.textChanged.connect(self._update_buttons)
+        self.experiment_name.textChanged.connect(self._experiment_name_changed)
 
         self.capture_message = QLabel("Capture FPS counts frames returned by OpenCV. Frame interval is host observed; neither is sensor latency.")
         self.capture_message.setWordWrap(True)
@@ -327,51 +323,6 @@ class LiveWorkbenchWindow(QMainWindow):
         splitter.addWidget(diagnostics)
         splitter.setSizes([920, 440])
         page_layout.addWidget(splitter, 1)
-        return page
-
-    def _build_history_tab(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 12, 14, 14)
-        header = QHBoxLayout()
-        title = QLabel("Recorded experiments and imported history")
-        title.setStyleSheet("font-size: 18px; font-weight: 600;")
-        self.history_refresh_button = QPushButton("Refresh")
-        self.history_refresh_button.clicked.connect(self.refresh_history)
-        header.addWidget(title)
-        header.addStretch(1)
-        header.addWidget(self.history_refresh_button)
-        layout.addLayout(header)
-
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        self.history_table = QTableWidget(0, 7)
-        self.history_table.setHorizontalHeaderLabels(
-            ("Experiment / run", "Camera", "Source", "Status", "Started", "Capture FPS", "Preview FPS")
-        )
-        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.history_table.setAlternatingRowColors(True)
-        self.history_table.verticalHeader().setVisible(False)
-        self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in range(1, 7):
-            self.history_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        self.history_table.currentCellChanged.connect(self._history_selection_changed)
-        splitter.addWidget(self.history_table)
-
-        detail_panel = QWidget()
-        detail_layout = QVBoxLayout(detail_panel)
-        detail_layout.setContentsMargins(4, 6, 4, 0)
-        detail_heading = QLabel("Experiment details")
-        detail_heading.setStyleSheet("font-size: 15px; font-weight: 600;")
-        self.history_details = QPlainTextEdit()
-        self.history_details.setReadOnly(True)
-        self.history_details.setPlaceholderText("Select a history row to inspect its settings and measurements.")
-        detail_layout.addWidget(detail_heading)
-        detail_layout.addWidget(self.history_details, 1)
-        splitter.addWidget(detail_panel)
-        splitter.setSizes([400, 260])
-        layout.addWidget(splitter, 1)
         return page
 
     @staticmethod
@@ -392,166 +343,18 @@ class LiveWorkbenchWindow(QMainWindow):
     def _tab_changed(self, index: int) -> None:
         if self.tabs.tabText(index) == "History":
             self.refresh_history()
+        elif self.tabs.tabText(index) == "Analysis":
+            self.analysis_workspace.refresh_experiments()
+
+    def _analyze_selected_history(self) -> None:
+        self.history_workspace.analyze_selected()
+
+    def _open_history_in_analysis(self, session_id: str, benchmark_id: str | None) -> None:
+        self.analysis_workspace.select_experiment(session_id, benchmark_id)
+        self.tabs.setCurrentWidget(self.analysis_workspace)
 
     def refresh_history(self) -> None:
-        if not hasattr(self, "history_table"):
-            return
-        try:
-            entries = self._database.history_entries()
-        except Exception as exc:
-            logger.exception("Could not load experiment history")
-            self.history_details.setPlainText(f"History could not be read: {exc}")
-            return
-
-        self.history_table.setRowCount(0)
-        for row_index, entry in enumerate(entries):
-            self.history_table.insertRow(row_index)
-            source = str(entry.get("source") or "unknown")
-            run_label = str(entry.get("session_label") or "Unnamed session")
-            benchmark_label = entry.get("benchmark_label")
-            if benchmark_label and source == "imported":
-                run_label = f"{run_label} · {benchmark_label}"
-            elif benchmark_label and run_label != benchmark_label:
-                run_label = f"{run_label} · {benchmark_label}"
-            camera_name = entry.get("model") or entry.get("stable_identifier") or "Identity unavailable"
-            source_label = "Imported CSV" if source == "imported" else "Live experiment" if source == "live_experiment" else source
-            status = entry.get("status") or ("imported" if source == "imported" else "session")
-            started = entry.get("benchmark_started_at") or entry.get("session_started_at") or "—"
-            values = (
-                run_label,
-                str(camera_name),
-                source_label,
-                str(status),
-                str(started),
-                self._format_optional_fps(entry.get("capture_fps")),
-                self._format_optional_fps(entry.get("preview_fps")),
-            )
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, (entry.get("session_id"), entry.get("benchmark_id")))
-                self.history_table.setItem(row_index, column, item)
-
-        if entries:
-            self.history_table.selectRow(0)
-        else:
-            self.history_details.setPlainText(
-                "No sessions are stored in this database yet. New recordings and imported CSV history will appear here."
-            )
-
-    @staticmethod
-    def _format_optional_fps(value: object) -> str:
-        return f"{float(value):.1f}" if value is not None else "—"
-
-    def _history_selection_changed(self, current_row: int, _current_column: int,
-                                   _previous_row: int, _previous_column: int) -> None:
-        if current_row < 0:
-            return
-        first_cell = self.history_table.item(current_row, 0)
-        if first_cell is None:
-            return
-        selection = first_cell.data(Qt.ItemDataRole.UserRole)
-        if not selection:
-            return
-        session_id, benchmark_id = selection
-        try:
-            detail = self._database.history_detail(benchmark_id, session_id)
-        except Exception as exc:
-            logger.exception("Could not load history details")
-            self.history_details.setPlainText(f"The selected history row could not be read: {exc}")
-            return
-
-        entry = detail["entry"]
-        lines = [
-            str(entry.get("label") or "Unnamed session"),
-            f"Source: {entry.get('source') or 'unknown'}",
-            f"Camera: {entry.get('model') or entry.get('stable_identifier') or 'identity unavailable'}",
-        ]
-        if entry.get("manufacturer"):
-            lines.append(f"Manufacturer: {entry['manufacturer']}")
-        lines.extend((
-            f"Stable identity: {entry.get('stable_identifier') or 'not recorded'}",
-            f"Started: {entry.get('benchmark_started_at') or entry.get('started_at') or 'unknown'}",
-            f"Ended: {entry.get('benchmark_ended_at') or entry.get('ended_at') or 'unknown'}",
-        ))
-        if entry.get("status"):
-            lines.append(f"Status: {entry['status']}")
-        if entry.get("notes"):
-            lines.extend(("", "Notes:", str(entry["notes"])))
-        if entry.get("source_basename"):
-            lines.extend((
-                "",
-                f"Imported source file: {entry['source_basename']}",
-                f"Original rows preserved: {entry.get('imported_row_count') or 0}",
-                f"Normalized measurements: {entry.get('imported_measurement_count') or 0}",
-            ))
-            if entry.get("raw_record_count") is not None:
-                lines.append(f"Raw records: {entry['raw_record_count']}")
-
-        if entry.get("duration_seconds") is not None:
-            lines.extend((
-                "",
-                "Summary:",
-                f"Duration: {float(entry['duration_seconds']):.3f} s",
-                f"Capture FPS: {self._format_optional_fps(entry.get('capture_fps'))}",
-                f"Preview FPS: {self._format_optional_fps(entry.get('preview_fps'))}",
-                f"Processing FPS: {self._format_optional_fps(entry.get('processing_fps'))}",
-                f"Frames: {entry.get('frame_count') or 0}",
-                f"Read failures: {entry.get('read_failures') or 0}",
-                f"Frame intervals: {entry.get('interval_count') or 0}",
-                f"Median interval: {self._format_optional_ms(entry.get('median_interval_ms'))}",
-                f"p95 interval: {self._format_optional_ms(entry.get('p95_interval_ms'))}",
-                f"p99 interval: {self._format_optional_ms(entry.get('p99_interval_ms'))}",
-                "Frame timing uses host timestamps after OpenCV read returns; it is not sensor-to-display latency.",
-            ))
-
-        settings = detail["settings"]
-        if settings:
-            lines.extend(("", "Requested and driver-reported settings:"))
-            for setting in settings:
-                requested = setting.get("requested_value_json")
-                reported = setting.get("reported_value_json")
-                try:
-                    requested = json.loads(requested) if requested is not None else "not requested"
-                    reported = json.loads(reported) if reported is not None else "not reported"
-                except (TypeError, json.JSONDecodeError):
-                    pass
-                lines.append(
-                    f"  {setting['setting_key']}: requested {requested}; reported {reported} "
-                    f"({setting.get('verification_status') or 'unknown'})"
-                )
-
-        configuration_json = entry.get("configuration_json")
-        if configuration_json:
-            lines.extend(("", "Capture configuration:"))
-            try:
-                lines.append(json.dumps(json.loads(configuration_json), ensure_ascii=False, indent=2, sort_keys=True))
-            except (TypeError, json.JSONDecodeError):
-                lines.append(str(configuration_json))
-
-        summary_json = entry.get("summary_json")
-        if summary_json:
-            try:
-                summary_data = json.loads(summary_json)
-                reason = summary_data.get("termination_reason")
-                if reason:
-                    lines.append(f"Termination reason: {reason}")
-            except (TypeError, json.JSONDecodeError):
-                pass
-
-        if detail["metrics"]:
-            lines.extend(("", "Stored measurement streams:"))
-            for metric in detail["metrics"]:
-                lines.append(
-                    f"  {metric['metric']} [{metric['stream_scope']}]: {metric['sample_count']} samples, "
-                    f"avg {float(metric['average']):.4g} {metric['unit']}, "
-                    f"range {float(metric['minimum']):.4g}–{float(metric['maximum']):.4g}"
-                )
-        self.history_details.setPlainText("\n".join(lines))
-
-    @staticmethod
-    def _format_optional_ms(value: object) -> str:
-        return f"{float(value):.3f} ms" if value is not None else "not available"
+        self.history_workspace.refresh()
 
     def refresh_cameras(self) -> None:
         prior_candidate = _candidate_for_combo(self.camera_combo)
@@ -561,9 +364,11 @@ class LiveWorkbenchWindow(QMainWindow):
         except Exception as exc:
             logger.exception("V4L2 discovery failed")
             self.top_status.setText(f"Camera discovery failed: {exc}")
+            self.multi_camera_workspace.discovery_failed(str(exc))
             return
 
         self._candidates = candidates
+        self.multi_camera_workspace.set_candidates(candidates)
         existing_ids = {candidate.identity.stable_identifier for candidate in candidates}
         if (self._active_stable_id and self._active_stable_id not in existing_ids
                 and self._worker and self._worker.is_alive()):
@@ -675,16 +480,22 @@ class LiveWorkbenchWindow(QMainWindow):
         candidate = _candidate_for_combo(self.camera_combo)
         worker = self._worker
         mode = _mode_for_combo(self.mode_combo)
-        if candidate is None or mode is None or worker is None:
-            self.recording_status.setText("Select a camera and start its preview before recording.")
+        snapshot = worker.snapshot() if worker is not None else None
+        message = recording_readiness_message(
+            has_camera=candidate is not None,
+            has_mode=mode is not None,
+            capture_ready=bool(
+                worker and worker.is_alive() and snapshot is not None
+                and snapshot.state == CaptureState.RUNNING
+                and snapshot.negotiated is not None
+            ),
+            has_name=bool(self.experiment_name.text().strip()),
+            capture_state=snapshot.state if snapshot is not None else None,
+        )
+        if message != "Ready to record; live preview will continue independently.":
+            self.recording_status.setText(message)
             return
-        snapshot = worker.snapshot()
-        if snapshot.state != CaptureState.RUNNING or snapshot.negotiated is None:
-            self.recording_status.setText("Wait for camera readback and a running preview before recording.")
-            return
-        if not self.experiment_name.text().strip():
-            self.recording_status.setText("Enter a short experiment name first.")
-            return
+        assert snapshot is not None
         try:
             duration = self.duration_combo.currentData(Qt.ItemDataRole.UserRole)
             self._recorder = ExperimentRecorder(
@@ -800,7 +611,7 @@ class LiveWorkbenchWindow(QMainWindow):
         if latest is not None:
             frame, self._last_frame_version, timestamp_ns = latest
             try:
-                self._last_image = _frame_to_image(frame)
+                self._last_image = frame_to_image(frame)
                 self._paint_preview()
                 self.preview_resolution.setText(f"{self._last_image.width()}×{self._last_image.height()}")
                 preview_ns = time.monotonic_ns()
@@ -909,14 +720,36 @@ class LiveWorkbenchWindow(QMainWindow):
         self.experiment_name.setEnabled(not recording_active)
         self.experiment_notes.setEnabled(not recording_active)
         self.duration_combo.setEnabled(not recording_active)
+        if not recording_active and self._last_recording_snapshot is None:
+            message = recording_readiness_message(
+                has_camera=candidate is not None,
+                has_mode=_mode_for_combo(self.mode_combo) is not None,
+                capture_ready=bool(
+                    capture_ready and self._worker
+                    and self._worker.snapshot().negotiated is not None
+                ),
+                has_name=bool(self.experiment_name.text().strip()),
+                capture_state=self._worker.snapshot().state if self._worker else None,
+            )
+            self.recording_status.setText(message)
+
+    def _experiment_name_changed(self, _text: str = "") -> None:
+        if self._recorder is None:
+            self._last_recording_snapshot = None
+        self._update_buttons()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override name
         self._poll_timer.stop()
         self._discovery_timer.stop()
+        unfinished = self.multi_camera_workspace.shutdown(timeout_seconds=0.75)
+        if unfinished:
+            logger.warning("Multi-camera workers still finishing during shutdown: %s", ", ".join(unfinished))
         self._finish_recording("application_shutdown")
         if self._worker and self._worker.is_alive():
             self._worker.request_stop()
             self._worker.join(timeout=0.75)
+        self.history_workspace.stop_background_work()
+        self.analysis_workspace.stop_background_work()
         event.accept()
 
 

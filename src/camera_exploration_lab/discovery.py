@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import fcntl
+import logging
+import struct
 from pathlib import Path
 
 from .models import BackendKind, CameraCandidate, CameraIdentity
@@ -11,6 +14,42 @@ _KNOWN_USB_CAMERAS: dict[tuple[str, str], tuple[str, str]] = {
     ("1415", "2000"): ("Sony", "PlayStation Eye"),
     ("07ca", "313a"): ("AVerMedia", "Live Streamer CAM 313"),
 }
+
+logger = logging.getLogger(__name__)
+
+# VIDIOC_QUERYCAP for struct v4l2_capability (104 bytes), built with Linux _IOC.
+_VIDIOC_QUERYCAP = (2 << 30) | (104 << 16) | (ord("V") << 8)
+_V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+_V4L2_CAP_VIDEO_CAPTURE_MPLANE = 0x00001000
+_V4L2_CAP_DEVICE_CAPS = 0x80000000
+
+
+def _query_v4l2_capabilities(device_path: Path) -> tuple[int, int] | None:
+    """Return (advertised capabilities, effective device capabilities) read-only."""
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(device_path, flags)
+    except OSError as exc:
+        logger.debug("Unable to query V4L2 capabilities for a video node: %s", exc)
+        return None
+    try:
+        payload = bytearray(104)
+        fcntl.ioctl(fd, _VIDIOC_QUERYCAP, payload, True)
+        advertised, device_caps = struct.unpack_from("=II", payload, 84)
+    except OSError as exc:
+        logger.debug("V4L2 capability query failed for a video node: %s", exc)
+        return None
+    finally:
+        os.close(fd)
+    effective = device_caps if advertised & _V4L2_CAP_DEVICE_CAPS else advertised
+    return advertised, effective
+
+
+def _supports_image_capture(effective_capabilities: int) -> bool:
+    return bool(effective_capabilities & (
+        _V4L2_CAP_VIDEO_CAPTURE | _V4L2_CAP_VIDEO_CAPTURE_MPLANE
+    ))
 
 
 def _read_text(path: Path) -> str | None:
@@ -39,7 +78,7 @@ def _usb_metadata(device_path: Path) -> dict[str, str | None]:
 
 
 class V4L2Discovery:
-    """Enumerate video nodes without opening them or changing camera controls."""
+    """Enumerate image-capture V4L2 nodes; querycap uses a read-only open."""
 
     def __init__(
         self,
@@ -70,6 +109,12 @@ class V4L2Discovery:
         for entry in sorted(self.sysfs_root.glob("video*")):
             node_name = entry.name
             current_node = self.dev_root / node_name
+            capabilities = _query_v4l2_capabilities(current_node)
+            if capabilities is None:
+                continue
+            advertised_caps, effective_caps = capabilities
+            if not _supports_image_capture(effective_caps):
+                continue
             device_link = entry / "device"
             try:
                 sysfs_device = device_link.resolve(strict=False)
@@ -116,6 +161,8 @@ class V4L2Discovery:
                     "usb_reported_manufacturer": usb.get("manufacturer"),
                     "usb_reported_product": usb.get("product"),
                     "device_node_is_ephemeral": True,
+                    "v4l2_capabilities": advertised_caps,
+                    "v4l2_device_caps": effective_caps,
                 },
             )
             candidates.append(

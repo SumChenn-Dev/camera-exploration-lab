@@ -20,6 +20,14 @@ from .models import (
     SettingSnapshot,
     utc_now_iso,
 )
+from .recording_ownership import (
+    RecordingOwnership,
+    RecordingOwnershipBusyError,
+    RecordingOwnershipError,
+    acquire_recording_ownership as _acquire_recording_ownership,
+    inspect_recording_recovery as _inspect_recording_recovery,
+    require_recording_ownership as _require_recording_ownership,
+)
 
 SCHEMA_VERSION = 2
 
@@ -189,6 +197,44 @@ class Database:
         finally:
             connection.close()
 
+    @contextmanager
+    def connect_readonly(self) -> Iterator[sqlite3.Connection]:
+        """Open a query-only connection without creating or initializing a database."""
+        if self._memory_uri is not None:
+            connection = sqlite3.connect(self._memory_uri, uri=True)
+        else:
+            if not self.path.is_file():
+                raise FileNotFoundError(f"database does not exist: {self.path}")
+            connection = sqlite3.connect(f"{self.path.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA query_only = ON")
+        try:
+            connection.execute("BEGIN")
+            yield connection
+        finally:
+            connection.close()
+
+    def acquire_recording_ownership(
+        self,
+        *,
+        owner_kind: str,
+        owner_token: str | None = None,
+        check_recovery: bool = True,
+    ) -> RecordingOwnership:
+        """Acquire the common cross-process lease for an experiment writer."""
+        return _acquire_recording_ownership(
+            self, owner_kind=owner_kind, owner_token=owner_token,
+            check_recovery=check_recovery,
+        )
+
+    def require_recording_ownership(self, owner_token: str) -> RecordingOwnership:
+        return _require_recording_ownership(self, owner_token)
+
+    def inspect_recording_recovery(self):
+        """Inspect recording states without changing the database."""
+        return _inspect_recording_recovery(self)
+
     def close(self) -> None:
         """Release the keeper connection for an in-memory database."""
         if self._memory_anchor is not None:
@@ -309,28 +355,7 @@ class Database:
         return setting.id
 
     def record_measurement(self, sample: MeasurementSample) -> str:
-        scope = sample.stream_scope.value if hasattr(sample.stream_scope, "value") else str(sample.stream_scope)
-        with self.connect() as connection:
-            connection.execute(
-                """INSERT INTO measurements (
-                       id, benchmark_id, raw_record_id, metric, value, unit, stream_scope,
-                       observed_at, elapsed_seconds, sample_index, interval_ns, method
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    sample.id,
-                    sample.benchmark_id,
-                    sample.raw_record_id,
-                    sample.metric,
-                    sample.value,
-                    sample.unit,
-                    scope,
-                    sample.observed_at,
-                    sample.elapsed_seconds,
-                    sample.sample_index,
-                    sample.interval_ns,
-                    sample.method,
-                ),
-            )
+        self.record_measurements_batch([sample])
         return sample.id
 
     def begin_live_experiment(
@@ -341,11 +366,20 @@ class Database:
         settings: list[SettingSnapshot],
         *,
         seen_at: str,
+        ownership: RecordingOwnership | None = None,
     ) -> tuple[str, str]:
         """Create an experiment and its initial settings in one transaction."""
+        if session.source == "live_experiment" and ownership is None:
+            raise RecordingOwnershipError("live experiment creation requires database recording ownership")
+        if session.source == "live_experiment" and (
+            (session.metadata or {}).get("recording_owner_token") != ownership.owner_token
+        ):
+            raise RecordingOwnershipError("live experiment owner identity does not match the database lease")
         camera_id = camera.stable_identifier
         backend = camera.backend.value if isinstance(camera.backend, BackendKind) else str(camera.backend)
         with self.connect() as connection:
+            if ownership is not None:
+                ownership.assert_active(self)
             connection.execute(
                 """INSERT INTO cameras (
                        id, stable_identifier, backend, device_path, manufacturer, model,
@@ -514,19 +548,94 @@ class Database:
             ),
         )
 
-    def record_measurements_batch(self, samples: list[MeasurementSample]) -> int:
+    def record_measurements_batch(
+        self,
+        samples: list[MeasurementSample],
+        *,
+        ownership: RecordingOwnership | None = None,
+    ) -> int:
         """Insert one bounded batch of timing data in a single SQLite transaction."""
+        return self._record_measurements_batch(samples, ownership=ownership)
+
+    def _record_measurements_batch(
+        self,
+        samples: list[MeasurementSample],
+        *,
+        ownership: RecordingOwnership | None,
+    ) -> int:
         if not samples:
             return 0
+        with self.connect() as connection:
+            if ownership is not None:
+                ownership.assert_active(self)
+            benchmark_ids = tuple(dict.fromkeys(sample.benchmark_id for sample in samples))
+            placeholders = ",".join("?" for _ in benchmark_ids)
+            active_rows = connection.execute(
+                f"""SELECT s.metadata_json FROM benchmark_runs b JOIN sessions s ON s.id=b.session_id
+                    WHERE b.id IN ({placeholders}) AND s.source='live_experiment'
+                      AND b.status='running'""",
+                benchmark_ids,
+            ).fetchall()
+            if active_rows and ownership is None:
+                raise RecordingOwnershipError("active live experiment samples require database ownership")
+            for row in active_rows:
+                metadata = json.loads(row["metadata_json"] or "{}")
+                if metadata.get("recording_owner_token") != ownership.owner_token:
+                    raise RecordingOwnershipError("active live experiment owner identity does not match")
+            return self._insert_measurements(connection, samples)
+
+    @staticmethod
+    def _insert_measurements(
+        connection: sqlite3.Connection,
+        samples: list[MeasurementSample] | tuple[MeasurementSample, ...],
+    ) -> int:
+        """Insert samples using the columns supported by this DB transaction."""
+        if not samples:
+            return 0
+        available_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(measurements)")
+        }
+        provenance_columns = {
+            "elapsed_ns", "source_timestamp_ns", "source_sequence", "source_clock"
+        }
+        present_provenance = provenance_columns & available_columns
+        if present_provenance and present_provenance != provenance_columns:
+            raise RuntimeError("measurement timing-provenance schema is incomplete")
+        has_v3_provenance = present_provenance == provenance_columns
         values = []
         for sample in samples:
             scope = sample.stream_scope.value if hasattr(sample.stream_scope, "value") else str(sample.stream_scope)
-            values.append((
+            if not has_v3_provenance and any((
+                sample.elapsed_ns is not None,
+                sample.source_timestamp_ns is not None,
+                sample.source_sequence is not None,
+                sample.source_clock is not None,
+            )):
+                raise RuntimeError("timing provenance fields require the grouped schema")
+            elapsed_seconds = sample.elapsed_seconds
+            if elapsed_seconds is None and sample.elapsed_ns is not None:
+                elapsed_seconds = sample.elapsed_ns / 1_000_000_000
+            row = (
                 sample.id, sample.benchmark_id, sample.raw_record_id, sample.metric,
                 sample.value, sample.unit, scope, sample.observed_at,
-                sample.elapsed_seconds, sample.sample_index, sample.interval_ns, sample.method,
-            ))
-        with self.connect() as connection:
+                elapsed_seconds, sample.sample_index, sample.interval_ns, sample.method,
+            )
+            if has_v3_provenance:
+                row += (
+                    sample.elapsed_ns, sample.source_timestamp_ns,
+                    sample.source_sequence, sample.source_clock,
+                )
+            values.append(row)
+        if has_v3_provenance:
+            connection.executemany(
+                """INSERT INTO measurements (
+                       id, benchmark_id, raw_record_id, metric, value, unit, stream_scope,
+                       observed_at, elapsed_seconds, sample_index, interval_ns, method,
+                       elapsed_ns, source_timestamp_ns, source_sequence, source_clock
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+        else:
             connection.executemany(
                 """INSERT INTO measurements (
                        id, benchmark_id, raw_record_id, metric, value, unit, stream_scope,
@@ -544,15 +653,36 @@ class Database:
         duration_seconds: float,
         status: str,
         termination_reason: str,
+        ownership: RecordingOwnership | None = None,
     ) -> dict[str, object]:
         if status not in {"completed", "interrupted", "failed"}:
             raise ValueError(f"invalid live experiment status: {status}")
         with self.connect() as connection:
+            if ownership is not None:
+                ownership.assert_active(self)
             benchmark = connection.execute(
                 "SELECT session_id FROM benchmark_runs WHERE id=?", (benchmark_id,)
             ).fetchone()
             if benchmark is None:
                 raise ValueError(f"unknown benchmark: {benchmark_id}")
+            session_owner = connection.execute(
+                "SELECT source, metadata_json FROM sessions WHERE id=?", (benchmark["session_id"],)
+            ).fetchone()
+            current_status = connection.execute(
+                "SELECT status FROM benchmark_runs WHERE id=?", (benchmark_id,)
+            ).fetchone()["status"]
+            if (
+                session_owner is not None and session_owner["source"] == "live_experiment"
+                and current_status == "running" and ownership is None
+            ):
+                raise RecordingOwnershipError("live experiment finalization requires database ownership")
+            if (
+                session_owner is not None and session_owner["source"] == "live_experiment"
+                and current_status == "running"
+            ):
+                metadata = json.loads(session_owner["metadata_json"] or "{}")
+                if metadata.get("recording_owner_token") != ownership.owner_token:
+                    raise RecordingOwnershipError("live experiment owner identity does not match")
             values = self._summary_values(connection, benchmark_id, duration_seconds, termination_reason)
             connection.execute(
                 "UPDATE benchmark_runs SET ended_at=?, status=? WHERE id=?",
@@ -563,10 +693,40 @@ class Database:
         return values
 
     def recover_interrupted_experiments(self, *, ended_at: str | None = None) -> int:
-        """Mark runs left by a dead application process as interrupted."""
+        """Mark dead-process v2 runs interrupted under the common database lock.
+
+        If another CEL recorder owns the database, recovery is skipped. The
+        caller can retry after that recorder finalizes.
+        """
+        if self._memory_uri is not None:
+            return 0
+        try:
+            ownership = self.acquire_recording_ownership(
+                owner_kind="legacy_startup_recovery", check_recovery=False
+            )
+        except RecordingOwnershipBusyError:
+            return 0
+        try:
+            ownership.assert_active(self)
+            with self.connect_readonly() as connection:
+                if int(connection.execute("PRAGMA user_version").fetchone()[0]) != SCHEMA_VERSION:
+                    return 0
+            return self._recover_interrupted_experiments_locked(
+                ownership=ownership, ended_at=ended_at
+            )
+        finally:
+            ownership.release(ownership.owner_token)
+
+    def _recover_interrupted_experiments_locked(
+        self,
+        *,
+        ownership: RecordingOwnership,
+        ended_at: str | None = None,
+    ) -> int:
         ended_at = ended_at or utc_now_iso()
         recovered = 0
         with self.connect() as connection:
+            ownership.assert_active(self)
             rows = connection.execute(
                 """SELECT b.id AS benchmark_id, b.session_id, s.started_at, s.metadata_json
                    FROM benchmark_runs b JOIN sessions s ON s.id=b.session_id
@@ -595,15 +755,31 @@ class Database:
         return recovered
 
     def history_entries(self) -> list[dict[str, object]]:
-        with self.connect() as connection:
-            rows = connection.execute(
-                """SELECT s.id AS session_id, b.id AS benchmark_id, s.label AS session_label,
+        """List history through a query-only connection; filtering never writes data."""
+        with self.connect_readonly() as connection:
+            return self.history_entries_snapshot(connection)
+
+    @staticmethod
+    def history_entries_snapshot(
+        connection: sqlite3.Connection,
+    ) -> list[dict[str, object]]:
+        """Read ordinary session/run rows from a caller's query-only snapshot."""
+        query_only = connection.execute("PRAGMA query_only").fetchone()
+        if query_only is None or int(query_only[0]) != 1:
+            raise RuntimeError("history snapshots require a query-only connection")
+        rows = connection.execute(
+            """SELECT s.id AS session_id, b.id AS benchmark_id, s.label AS session_label,
                           s.source, s.started_at AS session_started_at, s.ended_at AS session_ended_at,
                           s.notes, s.metadata_json AS session_metadata_json,
                           b.label AS benchmark_label, b.started_at AS benchmark_started_at,
                           b.ended_at AS benchmark_ended_at, b.status, b.configuration_json,
-                          c.stable_identifier, c.model, c.manufacturer,
+                          c.id AS camera_id, c.stable_identifier, c.identity_source,
+                          c.vendor_id, c.product_id, c.model, c.manufacturer,
                           i.source_basename,
+                          (SELECT GROUP_CONCAT(
+                               setting_key || ' ' || COALESCE(requested_value_json, '') || ' ' ||
+                               COALESCE(reported_value_json, ''), ' ')
+                           FROM setting_snapshots ss WHERE ss.benchmark_id=b.id) AS setting_search_text,
                           z.frame_count, z.read_failures, z.duration_seconds,
                           COALESCE(z.capture_fps, (SELECT AVG(m.value) FROM measurements m
                               WHERE m.benchmark_id=b.id AND m.metric='capture_fps' AND m.stream_scope='capture')) AS capture_fps,
@@ -617,16 +793,17 @@ class Database:
                    LEFT JOIN import_sources i ON i.session_id=s.id
                    LEFT JOIN benchmark_summaries z ON z.benchmark_id=b.id
                    ORDER BY COALESCE(b.started_at, s.started_at, s.created_at) DESC, b.id"""
-            ).fetchall()
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def history_detail(self, benchmark_id: str | None, session_id: str) -> dict[str, object]:
-        with self.connect() as connection:
+        with self.connect_readonly() as connection:
             if benchmark_id:
                 entry = connection.execute(
                     """SELECT s.*, b.id AS benchmark_id, b.label AS benchmark_label,
                               b.started_at AS benchmark_started_at, b.ended_at AS benchmark_ended_at,
-                              b.status, b.configuration_json, c.stable_identifier, c.model, c.manufacturer,
+                              b.status, b.configuration_json, c.stable_identifier, c.identity_source,
+                              c.vendor_id, c.product_id, c.model, c.manufacturer,
                               i.source_basename, i.row_count AS imported_row_count,
                               i.measurement_count AS imported_measurement_count,
                               z.frame_count, z.read_failures, z.duration_seconds, z.capture_fps,
@@ -644,7 +821,7 @@ class Database:
                     """SELECT s.*, NULL AS benchmark_id, NULL AS benchmark_label,
                               NULL AS benchmark_started_at, NULL AS benchmark_ended_at,
                               NULL AS status, NULL AS configuration_json, c.stable_identifier,
-                              c.model, c.manufacturer, i.source_basename,
+                              c.identity_source, c.vendor_id, c.product_id, c.model, c.manufacturer, i.source_basename,
                               i.row_count AS imported_row_count, i.measurement_count AS imported_measurement_count,
                               NULL AS frame_count, NULL AS read_failures, NULL AS duration_seconds,
                               NULL AS capture_fps, NULL AS preview_fps, NULL AS processing_fps,

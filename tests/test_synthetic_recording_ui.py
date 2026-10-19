@@ -705,14 +705,19 @@ class SyntheticRecordingUiTests(unittest.TestCase):
     def test_duplicate_record_request_cannot_create_a_second_group(self) -> None:
         window = self.make_window()
         self.acknowledge_and_start(window)
+        failures = QSignalSpy(window._worker.action_failed)
         window.request_record_both.emit(5.0, False)
         window.request_record_both.emit(5.0, False)
         self.assertTrue(wait_until(lambda: window._latest_view is not None
                                    and window._latest_view.session_id is not None
                                    and window._latest_view.recording_state.startswith("Recording")))
         session_id = window._latest_view.session_id
+        self.assertTrue(wait_until(lambda: any(
+            event[0] == "record_both" and "already active" in event[1].lower()
+            for event in (failures.at(i) for i in range(failures.count()))
+        )))
         self.assertEqual(window._latest_view.session_id, session_id)
-        self.assertTrue(wait_until(lambda: "already active" in window.state_label.text().lower()))
+        self.assertTrue(window._latest_view.recording_state.startswith("Recording"))
         window.close()
         self.assertTrue(wait_until(lambda: window._close_complete))
 

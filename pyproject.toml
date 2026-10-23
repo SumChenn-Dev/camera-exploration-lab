@@ -26,6 +26,9 @@ celab = "camera_exploration_lab.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+camera_exploration_lab = ["replay_data/canon_live_view/*.csv", "replay_data/canon_live_view/manifest.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

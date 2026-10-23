@@ -183,6 +183,11 @@ class CameraSlotPanel(QGroupBox):
         return self._worker
 
     @property
+    def preview_fps(self) -> float:
+        """Current GUI preview-update rate, measured independently of capture."""
+        return self._preview_fps
+
+    @property
     def candidate(self) -> CameraCandidate | None:
         value = self.camera_combo.currentData(Qt.ItemDataRole.UserRole)
         return value if isinstance(value, CameraCandidate) else None

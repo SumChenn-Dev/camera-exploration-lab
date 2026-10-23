@@ -39,6 +39,9 @@ data/
 *.avi
 *.mkv
 *.webm
+# Reviewed, public Canon benchmark replay fixtures bundled by CEL-014.
+!src/camera_exploration_lab/replay_data/canon_live_view/*.csv
+!src/camera_exploration_lab/replay_data/canon_live_view/manifest.json
 .env
 .env.*
 *.pem

@@ -1,0 +1,68 @@
+[
+  {
+    "public_file": "01_initial_fps_sweep.csv",
+    "rows": 174,
+    "source_sha256": "9893293e479142390911035ece05c2f769e0c8154c2b9c4b3caf11f7f40d547c",
+    "public_sha256": "b555c9f50905c00b44feff36dd1e99174fedd0bc9ec8f5fde2c1d032f1fd8525",
+    "privacy_transform": [
+      "removed timestamp column",
+      "renamed file to descriptive sequence name",
+      "no local path recorded"
+    ]
+  },
+  {
+    "public_file": "02_dropframe_ab.csv",
+    "rows": 228,
+    "source_sha256": "f23b60f265139b1192faa770e761729e02c09eb21ad90c50a023a93ee189de88",
+    "public_sha256": "0af953a03e7984d1bb739014c0f5da4c0a93f5da69ca63bd64c65e870795de93",
+    "privacy_transform": [
+      "removed timestamp column",
+      "renamed file to descriptive sequence name",
+      "no local path recorded"
+    ]
+  },
+  {
+    "public_file": "03_live_pipeline_profile.csv",
+    "rows": 133,
+    "source_sha256": "54534e1dd0642cdf9ae83f2e3bddf144e3d4e2d61306bf090d4a1377ba110234",
+    "public_sha256": "f6e793cd9abb76c981f3de96ffec35aefa5bbc8cfa2cdb9e8f2d894b35933ca8",
+    "privacy_transform": [
+      "removed timestamp column",
+      "renamed file to descriptive sequence name",
+      "no local path recorded"
+    ]
+  },
+  {
+    "public_file": "04_device_polling_ab.csv",
+    "rows": 87,
+    "source_sha256": "dfcb90c366315790b93f61b10517d9450d6ba80369d735f019abba2e354faceb",
+    "public_sha256": "3fb732f29dc323156b92232cf3701e2d7de7a6a20d58d5a13aa3185fe27b1950",
+    "privacy_transform": [
+      "removed timestamp column",
+      "renamed file to descriptive sequence name",
+      "no local path recorded"
+    ]
+  },
+  {
+    "public_file": "05_smart_polling_fps_sweep.csv",
+    "rows": 144,
+    "source_sha256": "32b51e637300d258dac59329fb2ac720b441be562a81c8349ba25bbd05fd4f67",
+    "public_sha256": "62af21f20dd6a380c848d613a75c72739b09671f1c1ce5a2e22a77bc4ea2b76b",
+    "privacy_transform": [
+      "removed timestamp column",
+      "renamed file to descriptive sequence name",
+      "no local path recorded"
+    ]
+  },
+  {
+    "public_file": "06_content_freshness.csv",
+    "rows": 96,
+    "source_sha256": "62a4778a8a1e2910e47939698a0570b5041b978498a71cf146f9e508b52ed966",
+    "public_sha256": "1e3225604b697a85258139a117458a4e6016513c91d189d17389f5ca7ff8e3e3",
+    "privacy_transform": [
+      "removed timestamp column",
+      "renamed file to descriptive sequence name",
+      "no local path recorded"
+    ]
+  }
+]

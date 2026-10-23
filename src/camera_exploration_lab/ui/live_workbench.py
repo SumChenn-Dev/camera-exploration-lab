@@ -39,6 +39,7 @@ from .analysis_workspace import AnalysisWorkspace
 from .history_workspace import HistoryWorkspace
 from .multi_camera_workbench import MultiCameraWorkspace
 from .preview import frame_to_image
+from .performance_monitor import LiveCaptureSource, PerformanceMonitorWorkspace
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,8 @@ class LiveWorkbenchWindow(QMainWindow):
             refresh_requested=self.refresh_cameras, capture_factory=self._capture_factory
         )
         self.tabs.addTab(self.multi_camera_workspace, "Multi-Camera")
+        self.performance_monitor = PerformanceMonitorWorkspace(source_provider=self._performance_sources)
+        self.tabs.addTab(self.performance_monitor, "Performance Monitor")
         self.history_workspace = HistoryWorkspace(self._database)
         self.history_workspace.analyze_requested.connect(self._open_history_in_analysis)
         self.history_table = self.history_workspace.history_table
@@ -345,6 +348,21 @@ class LiveWorkbenchWindow(QMainWindow):
             self.refresh_history()
         elif self.tabs.tabText(index) == "Analysis":
             self.analysis_workspace.refresh_experiments()
+
+    def _performance_sources(self) -> tuple[LiveCaptureSource, ...]:
+        """Expose existing workers read-only; the monitor never opens a camera."""
+        sources: list[LiveCaptureSource] = []
+        if self._worker is not None:
+            sources.append(LiveCaptureSource(
+                "single-camera", "Single Camera", self._worker, self._preview_fps
+            ))
+        for key, label, slot in (
+            ("camera-a", "Camera A", self.multi_camera_workspace.slot_a),
+            ("camera-b", "Camera B", self.multi_camera_workspace.slot_b),
+        ):
+            if slot.worker is not None:
+                sources.append(LiveCaptureSource(key, label, slot.worker, slot.preview_fps))
+        return tuple(sources)
 
     def _analyze_selected_history(self) -> None:
         self.history_workspace.analyze_selected()

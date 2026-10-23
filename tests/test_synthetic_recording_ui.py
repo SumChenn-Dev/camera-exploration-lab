@@ -27,6 +27,7 @@ from camera_exploration_lab.schema_migrations import SYNTHETIC_DATABASE_APPLICAT
 from camera_exploration_lab.ui.synthetic_recording_harness import (
     SyntheticCaptureSource,
     SyntheticRecordingWindow,
+    _SyntheticRecordingWorker,
     parse_demo_args,
 )
 
@@ -880,6 +881,25 @@ class SyntheticRecordingUiTests(unittest.TestCase):
                 self.assertTrue(wait_until(lambda: window._close_complete, 4.0))
         self.assertFalse(window._thread.isRunning())
 
+    def test_shutdown_poll_initializes_deadline_if_close_flag_precedes_queued_slot(self) -> None:
+        requested = threading.Event()
+        worker = _SyntheticRecordingWorker(requested)
+        completions = []
+        worker.shutdown_finished.connect(lambda complete, _message: completions.append(complete))
+        requested.set()
+
+        # This models the timer poll running after closeEvent sets the shared
+        # event but before its queued request_shutdown slot reaches the worker.
+        worker._tick()
+
+        self.assertIsNotNone(worker._shutdown_started_at)
+        self.assertEqual(worker._operation, "Shutdown complete")
+        self.assertTrue(worker._shutdown_complete)
+        self.assertFalse(worker._shutdown_running)
+        self.assertEqual(completions, [True])
+        worker.request_shutdown()
+        self.assertEqual(completions, [True])
+
     def test_close_during_slow_writer_reports_unresolved_then_finishes_after_drain(self) -> None:
         window = self.make_window()
         self.acknowledge_and_start(window)
@@ -908,6 +928,12 @@ class SyntheticRecordingUiTests(unittest.TestCase):
                         lambda: "deadline exceeded" in window.state_label.text().lower(),
                         2.5,
                     ))
+                    # Let multiple 200 ms worker status polls run while the
+                    # writer remains blocked; the unresolved warning must stay visible.
+                    warning_refresh = QEventLoop()
+                    QTimer.singleShot(450, warning_refresh.quit)
+                    warning_refresh.exec()
+                    self.assertIn("deadline exceeded", window.state_label.text().lower())
                     self.assertFalse(window._close_complete)
                     self.assertTrue(self.sources["A"]._stop.is_set() or self.sources["B"]._stop.is_set())
                 finally:

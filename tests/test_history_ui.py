@@ -117,7 +117,7 @@ class HistoryAndRecordingWindowTests(unittest.TestCase):
         labels = [window.tabs.tabText(index) for index in range(window.tabs.count())]
         self.assertEqual(
             labels,
-            ["Live Workbench", "Multi-Camera", "History", "Analysis", "Exports"],
+            ["Live Workbench", "Multi-Camera", "Performance Monitor", "History", "Analysis", "Exports"],
         )
         self.assertIsNotNone(window.multi_camera_workspace)
         self.assertEqual(window.history_workspace.database, self.database)

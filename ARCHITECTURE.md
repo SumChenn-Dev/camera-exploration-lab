@@ -6,6 +6,7 @@
 PySide6 desktop shell
     ├── Live Workbench (single-camera preview, recording, and persistent performance panel)
     ├── Multi-Camera (two independent live V4L2 capture slots; Pass 1)
+    ├── Performance Monitor (read-only capture telemetry and Canon CSV replay; CEL-014 Phase 1)
     ├── History (experiments and imported measurements)
     ├── Analysis (read-only timing analysis and two-run comparison)
     ├── Exports (future tab)
@@ -34,7 +35,7 @@ Specialized computer-vision experiments should be optional extensions. An extens
 | Storage | Python `sqlite3` | Schema v2 is active; v3 grouped schema is synthetic-test-only and not enabled at startup |
 | V4L2 discovery | sysfs identity plus read-only `VIDIOC_QUERYCAP` | Implemented; image-capture nodes only |
 | Capture-mode enumeration | read-only `VIDIOC_ENUM_FMT`, `VIDIOC_ENUM_FRAMESIZES`, and `VIDIOC_ENUM_FRAMEINTERVALS` | Implemented in Multi-Camera; only reported discrete options and range endpoints are offered |
-| Desktop | PySide6 | Optional `desktop` extra; Live Workbench, History, and Analysis implemented |
+| Desktop | PySide6 | Optional `desktop` extra; Live Workbench, Performance Monitor, History, and Analysis implemented |
 | Graphs | PyQtGraph | Optional `desktop` extra; interval/FPS plots and interval-distribution comparison implemented |
 | Frame capture and processing | NumPy + `opencv-python-headless` | Optional `desktop` extra; V4L2 capture worker implemented |
 | Canon remote control | CHDKPTP process adapter | Future backend; no Canon control is part of this phase |
@@ -45,11 +46,17 @@ The headless OpenCV wheel avoids bundling a second Qt runtime alongside PySide6.
 
 `V4L2Discovery` uses sysfs for identity and briefly opens each present node read-only to issue `VIDIOC_QUERYCAP`; it does not set camera controls. When the driver advertises `V4L2_CAP_DEVICE_CAPS`, discovery uses that effective per-node mask instead of the broader `capabilities` mask. Only `VIDEO_CAPTURE` and `VIDEO_CAPTURE_MPLANE` nodes appear in the camera selector. Metadata-only nodes are filtered out, while valid virtual capture devices such as OBS Virtual Camera remain eligible. If a `/dev/v4l/by-id` alias points to a node, that alias becomes the stable identifier. The current `/dev/videoN` node is saved separately as the open path because its number can change. Without a by-id alias, discovery derives an endpoint identity from USB IDs plus serial or port topology and the V4L2 interface index, then falls back to the sysfs device path.
 
-The camera model supports `v4l2`, `chdkptp`, and `unknown` backends. A future CHDKPTP adapter will expose cameras through the same selection and session APIs; the installed presence of a CHDKPTP executable is not treated as proof that a camera is connected.
+The camera model supports `v4l2`, `chdkptp`, and `unknown` backends. A future CHDKPTP adapter will expose cameras through the same selection and session APIs; the installed presence of a CHDKPTP executable is not treated as proof that a camera is connected. For live Canon telemetry, CEL must consume an explicit scalar export or local IPC channel from the process that already owns CHDKPTP's USB/PTP connection. CEL must not open a competing PTP connection to collect performance data. That export/IPC is future work; CHDKPTP implementation code is not incorporated.
 
 ## Capture, preview, and measurement ownership
 
 The camera-owning OpenCV worker runs on a dedicated thread. It overwrites a one-frame latest-frame slot for preview, so a slow UI skips stale display frames instead of building a frame queue. A high capture rate therefore does not require the UI to render at that rate. Preview FPS is calculated from frames rendered by the UI; capture FPS is calculated from successful `VideoCapture.read()` returns. Future image-processing stages report their own FPS.
+
+CEL-014 Phase 1 adds a separate bounded scalar telemetry ring to each capture worker. It is not a listener callback and does not take the existing exclusive timing-listener slot used by the single-camera recorder. Successful read-return events append the host-monotonic timestamp, rolling successful-read rate, read-return interval, `read()` call duration, counts, and worker state to this overwrite-oldest ring. The Performance Monitor polls it at 10 Hz and updates bounded plots; capture workers do not emit per-frame Qt signals. If a UI falls behind, old monitor samples may be overwritten and the monitor reports that fact. Preview buffers and recorder event handling remain independent.
+
+The Performance Monitor is a separate tab. Historical mode hash-checks the six bundled, public Canon CHDKPTP CSVs against their public manifest and retains settling rows and status. The source `elapsed_s` restarts at benchmark-stage boundaries. For playback only, the view concatenates stage-local segments using recorded `sample_s` where available and source elapsed spacing otherwise; this replay schedule is not a wall-clock or synchronization axis. Requested FPS, CHDKPTP-reported FPS, completed payload fetches/s, threshold-classified content changes/s, host fetch-call duration, polling, and skip counts retain separate metric identifiers and provenance. Unrecorded values remain explicitly unavailable or not recorded.
+
+Live mode reads only workers already owned by the Single Camera or Multi-Camera workbench. It measures successful OpenCV read returns and host duration around the `read()` call; the latter includes backend and driver waiting and is not USB-only latency. GUI preview-update FPS is reported separately and does not claim physical display presentation. OpenCV host timestamps do not provide exposure time, USB transfer time, sensor frame-drop counts, or hardware synchronization. The monitor adds no database schema or experiment persistence.
 
 The Multi-Camera workspace composes two instances of the same `OpenCVCaptureWorker` used by the single-camera workbench; it does not create a second capture engine. Each instance owns one V4L2/OpenCV handle, capture clock, read-failure count, requested mode, negotiated readback, and one-frame latest buffer. The Qt workspace polls both snapshots on its GUI timer and converts at most one latest frame per slot per update. New captures overwrite stale preview frames; the UI never queues every captured frame. OpenCV format decode occurs inside each independent worker's `read()`; GUI image conversion and scaling occur on the GUI thread after bounded handoff.
 

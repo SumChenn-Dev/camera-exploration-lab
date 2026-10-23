@@ -308,6 +308,7 @@ class _SyntheticRecordingWorker(QObject):
         self._operation = "Idle"
         self._last_error: str | None = None
         self._shutdown_running = False
+        self._shutdown_complete = False
         self._shutdown_started_at: float | None = None
         self._shutdown_warning_emitted = False
         self._last_shutdown_notice: str | None = None
@@ -572,7 +573,7 @@ class _SyntheticRecordingWorker(QObject):
 
     @Slot()
     def request_shutdown(self) -> None:
-        if self._shutdown_running:
+        if self._shutdown_running or self._shutdown_complete:
             return
         self._shutdown_running = True
         self._shutdown_started_at = time.monotonic()
@@ -625,6 +626,7 @@ class _SyntheticRecordingWorker(QObject):
                     self._last_error = self._safe_error(exc)
                     details += " Finalization is committed, but temporary synthetic data cleanup failed and was retained."
         self._operation = "Shutdown complete" if not unresolved else "Shutdown complete with unresolved synthetic recording"
+        self._shutdown_complete = True
         self._shutdown_running = False
         if self._timer is not None:
             self._timer.stop()
@@ -638,12 +640,14 @@ class _SyntheticRecordingWorker(QObject):
             and time.monotonic() - self._shutdown_started_at >= SHUTDOWN_UNRESOLVED_WARNING_SECONDS
         ):
             self._shutdown_warning_emitted = True
+        if self._shutdown_warning_emitted:
+            # Keep the unresolved warning visible on later polls. Replacing it
+            # with the shorter progress text made it disappear after one tick.
             detail = (
                 "Shutdown deadline exceeded; finalization remains unresolved. "
                 "The harness keeps the writer and database alive and continues checking; "
                 "no completed status is asserted. " + detail
             )
-            self._last_shutdown_notice = None
         if detail != self._last_shutdown_notice:
             self._last_shutdown_notice = detail
             self.shutdown_finished.emit(False, detail)
@@ -763,7 +767,13 @@ class _SyntheticRecordingWorker(QObject):
                         self._last_error = self._safe_error(exc)
                     self._ended_slots.add(slot)
         if self._shutdown_requested.is_set():
-            self._try_shutdown()
+            # closeEvent sets the shared flag before its queued request slot runs.
+            # If this timer poll wins that race, initialize the deadline through
+            # the same idempotent path so shutdown is not attempted twice first.
+            if not self._shutdown_running:
+                self.request_shutdown()
+            else:
+                self._try_shutdown()
         else:
             if self._auto_stop_pending:
                 self._poll_automatic_source_stop()
@@ -1274,7 +1284,7 @@ class SyntheticRecordingWindow(QWidget):
     @Slot(object)
     def _on_snapshot(self, view: SyntheticHarnessView) -> None:
         self._latest_view = view
-        if self._pending_action is None:
+        if self._pending_action is None and not self._close_pending:
             self.state_label.setText(view.operation)
         self.capture_status_label.setText(view.capture_status_message)
         self.group_id_label.setText(view.session_id or "—")

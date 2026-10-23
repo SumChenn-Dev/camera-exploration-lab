@@ -19,6 +19,15 @@ from typing import Any, Callable, Protocol
 
 from .capture_modes import CaptureMode
 from .models import CameraCandidate
+from .performance import (
+    Availability,
+    BoundedTelemetryBuffer,
+    ClockDomain,
+    Metric,
+    MeasurementKind,
+    TelemetrySample,
+    reading,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -233,11 +242,16 @@ class OpenCVCaptureWorker(threading.Thread):
         frame_buffer: LatestFrameBuffer | None = None,
         read_failure_limit: int = 10,
         worker_label: str | None = None,
+        telemetry_buffer: BoundedTelemetryBuffer | None = None,
     ) -> None:
         super().__init__(name=f"celab-capture-{worker_label or mode.name}", daemon=True)
         self.device = device
         self.mode = mode
         self.frame_buffer = frame_buffer or LatestFrameBuffer()
+        # Pollable scalar telemetry has separate ownership from the exclusive
+        # recorder listener. It never carries frame arrays or Qt signals.
+        self.telemetry_buffer = telemetry_buffer or BoundedTelemetryBuffer()
+        self._telemetry_sequence = 0
         self._capture_factory = capture_factory or _open_opencv_capture
         self._read_failure_limit = max(1, read_failure_limit)
         self._stop_event = threading.Event()
@@ -317,6 +331,70 @@ class OpenCVCaptureWorker(threading.Thread):
             # Persistence or GUI issues must not stall the independent camera loop.
             logger.exception("Camera timing listener failed")
 
+    def _publish_capture_telemetry(
+        self,
+        *,
+        timestamp_ns: int,
+        read_duration_ns: int,
+        capture_fps: float,
+        frame_interval_ns: int | None,
+        frame_count: int,
+        read_failures: int,
+        connection_state: str,
+    ) -> None:
+        """Append one bounded scalar event without touching the recorder slot."""
+        readings = [
+            reading(
+                Metric.REQUESTED_FPS,
+                self.mode.fps,
+                kind=MeasurementKind.REQUESTED if self.mode.fps is not None else None,
+                availability=(Availability.AVAILABLE if self.mode.fps is not None else Availability.UNAVAILABLE),
+                provenance="Capture mode request; this is not driver readback.",
+            ),
+            reading(
+                Metric.OPENCV_CAPTURE_FPS,
+                max(0.0, capture_fps),
+                kind=MeasurementKind.DERIVED,
+                provenance="Successful OpenCV reads counted over the worker's host-monotonic rolling window.",
+            ),
+            reading(
+                Metric.FRAME_INTERVAL_MS,
+                frame_interval_ns / 1_000_000 if frame_interval_ns is not None else None,
+                kind=MeasurementKind.OBSERVED if frame_interval_ns is not None else None,
+                availability=(Availability.AVAILABLE if frame_interval_ns is not None else Availability.UNAVAILABLE),
+                provenance="Difference between successive successful OpenCV read-return timestamps.",
+            ),
+            reading(
+                Metric.OPENCV_READ_CALL_DURATION_MS,
+                read_duration_ns / 1_000_000,
+                provenance="Host-monotonic duration around cv2.VideoCapture.read(); not USB-only latency.",
+            ),
+            reading(
+                Metric.SUCCESSFUL_FRAME_COUNT,
+                frame_count,
+                provenance="Cumulative successful reads in this capture-worker run.",
+            ),
+            reading(
+                Metric.READ_FAILURES,
+                read_failures,
+                provenance="Cumulative unsuccessful OpenCV reads in this capture-worker run.",
+            ),
+            reading(
+                Metric.CONNECTION_STATE,
+                connection_state,
+                provenance="Capture worker state at the host read-return observation.",
+            ),
+        ]
+        sample = TelemetrySample(
+            timestamp_ns=timestamp_ns,
+            source="OpenCV/V4L2 capture worker",
+            clock_domain=ClockDomain.HOST_MONOTONIC,
+            readings=tuple(readings),
+            sequence=self._telemetry_sequence,
+        )
+        self.telemetry_buffer.append(sample)
+        self._telemetry_sequence += 1
+
     def _update(self, **changes: Any) -> None:
         with self._snapshot_lock:
             self._snapshot = replace(self._snapshot, **changes)
@@ -362,8 +440,10 @@ class OpenCVCaptureWorker(threading.Thread):
             last_snapshot_ns = 0
 
             while not self._stop_event.is_set():
+                read_started_ns = time.monotonic_ns()
                 ok, frame = capture.read()
                 captured_ns = time.monotonic_ns()
+                read_duration_ns = max(0, captured_ns - read_started_ns)
                 if not ok or frame is None:
                     consecutive_failures += 1
                     current = self.snapshot()
@@ -371,9 +451,6 @@ class OpenCVCaptureWorker(threading.Thread):
                     self._update(
                         read_failures=total_failures,
                         elapsed_seconds=(captured_ns - capture_started_ns) / 1_000_000_000,
-                    )
-                    self._emit_timing(
-                        "read_failure", captured_ns, capture_fps=current.capture_fps
                     )
                     if consecutive_failures >= self._read_failure_limit:
                         self._update(
@@ -383,6 +460,23 @@ class OpenCVCaptureWorker(threading.Thread):
                                 "or its stream ended."
                             ),
                         )
+                    self._publish_capture_telemetry(
+                        timestamp_ns=captured_ns,
+                        read_duration_ns=read_duration_ns,
+                        capture_fps=current.capture_fps,
+                        frame_interval_ns=None,
+                        frame_count=current.frame_count,
+                        read_failures=total_failures,
+                        connection_state=(
+                            CaptureState.UNAVAILABLE.value
+                            if consecutive_failures >= self._read_failure_limit
+                            else CaptureState.RUNNING.value
+                        ),
+                    )
+                    self._emit_timing(
+                        "read_failure", captured_ns, capture_fps=current.capture_fps
+                    )
+                    if consecutive_failures >= self._read_failure_limit:
                         break
                     self._stop_event.wait(0.005)
                     continue
@@ -395,15 +489,24 @@ class OpenCVCaptureWorker(threading.Thread):
                     frame_interval_ms = frame_interval_ns / 1_000_000
                 previous_frame_ns = captured_ns
                 capture_fps = frame_rate.add(captured_ns)
+                current = self.snapshot()
+                frame_count = current.frame_count + 1
 
                 self.frame_buffer.publish(frame, captured_ns)
+                self._publish_capture_telemetry(
+                    timestamp_ns=captured_ns,
+                    read_duration_ns=read_duration_ns,
+                    capture_fps=capture_fps,
+                    frame_interval_ns=frame_interval_ns,
+                    frame_count=frame_count,
+                    read_failures=current.read_failures,
+                    connection_state=CaptureState.RUNNING.value,
+                )
                 self._emit_timing(
                     "frame_arrival", captured_ns,
                     interval_ns=frame_interval_ns,
                     capture_fps=capture_fps,
                 )
-                current = self.snapshot()
-                frame_count = current.frame_count + 1
                 now_ns = captured_ns
                 if now_ns - last_snapshot_ns >= 100_000_000 or frame_count == 1:
                     self._update(

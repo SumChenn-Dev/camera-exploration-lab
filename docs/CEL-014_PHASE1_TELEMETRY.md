@@ -70,7 +70,7 @@ The replay displays requested FPS, CHDKPTP-reported rate, completed payload fetc
 
 The current working Canon CHDKPTP application owns the SX40 HS USB/PTP connection. CEL must not create a second connection or poll the device while that process is active. A later adapter should consume a documented scalar export or local IPC stream produced by the CHDKPTP owner process. That protocol should carry source sequence, host monotonic timestamp and clock/process identity, metric identifier, unit, availability, and provenance. It should distinguish attempted fetches from completed payload fetches and any separately measured content-change estimate.
 
-The existing Canon research is data and methodology, not permission to copy CHDKPTP code. No GPL implementation source is incorporated here. No Canon command, control, connection, or live telemetry IPC is implemented in Phase 1.
+The existing Canon research is data and methodology, not permission to copy CHDKPTP code. No GPL implementation source is incorporated here. No Canon command, control, or camera connection is implemented in Phase 1. The CEL-side, mock-tested local IPC receiver added in Phase 2 is documented separately in [CEL-014 Phase 2 Canon Telemetry Bridge](CEL-014_PHASE2_CANON_TELEMETRY.md); it still requires a future CHDKPTP-side exporter and does not establish genuine live Canon telemetry.
 
 ## Verification
 

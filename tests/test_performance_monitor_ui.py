@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
@@ -51,6 +53,199 @@ class SyntheticPerformanceMonitorUiTests(unittest.TestCase):
         self.workspace.reset_button.click()
         self.assertEqual(self.workspace._controller.index, 0)
         self.assertEqual(self.workspace.play_button.text(), "Play")
+
+    def test_dataset_switch_during_playback_after_pause_and_at_end_restores_play(self) -> None:
+        self.workspace = PerformanceMonitorWorkspace()
+        self.workspace.play_button.click()
+        self.assertFalse(self.workspace.play_button.isEnabled())
+        self.workspace.dataset_combo.setCurrentIndex(1)
+        APP.processEvents()
+        self.assertFalse(self.workspace._controller.playing)
+        self.assertTrue(self.workspace.play_button.isEnabled())
+        self.assertFalse(self.workspace.pause_button.isEnabled())
+
+        self.workspace.play_button.click()
+        self.workspace.pause_button.click()
+        self.assertTrue(self.workspace.play_button.isEnabled())
+        self.workspace.dataset_combo.setCurrentIndex(2)
+        APP.processEvents()
+        self.assertTrue(self.workspace.play_button.isEnabled())
+        self.assertFalse(self.workspace._controller.playing)
+
+        self.workspace.play_button.click()
+        self.workspace._controller.advance(
+            time.monotonic_ns() + round((self.workspace._controller.dataset.duration_seconds + 2) * 1_000_000_000)
+        )
+        self.workspace._show_current_replay()
+        self.assertTrue(self.workspace.play_button.isEnabled())
+        self.workspace.dataset_combo.setCurrentIndex(3)
+        APP.processEvents()
+        self.assertEqual(self.workspace.play_button.text(), "Play")
+        self.assertTrue(self.workspace.play_button.isEnabled())
+        self.assertFalse(self.workspace.pause_button.isEnabled())
+
+    def test_live_canon_mode_consumes_mock_ipc_without_camera_or_qt_signal_stream(self) -> None:
+        from camera_exploration_lab.canon_telemetry_ipc import (
+            PROTOCOL_NAME,
+            PROTOCOL_VERSION,
+            CanonTelemetryConsumer,
+            ConsumerState,
+            parse_message,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="cel-canon-ui-") as temporary:
+            consumer = CanonTelemetryConsumer(Path(temporary) / "canon.sock", stale_after_s=1.0)
+            self.workspace = PerformanceMonitorWorkspace(
+                source_provider=lambda: self.fail("Canon mode must not enumerate or start a CEL camera"),
+                canon_consumer=consumer,
+            )
+            self.workspace.mode_combo.setCurrentIndex(2)
+            self.workspace.show()
+            APP.processEvents()
+            self.assertEqual(self.workspace.mode_combo.currentData(), "canon")
+            self.assertIn("LIVE CANON", self.workspace.banner.text())
+            self.assertTrue(self.workspace.listen_button.isVisible())
+            consumer.start = lambda: consumer._set_state(ConsumerState.STARTING)
+            self.workspace.listen_button.click()
+            self.assertEqual(consumer.snapshot().state, ConsumerState.STARTING)
+            message = {
+                "protocol": PROTOCOL_NAME,
+                "version": PROTOCOL_VERSION,
+                "type": "measurement",
+                "producer_id": "chdkptp-mock",
+                "camera_id": "canon-sx40-hs",
+                "camera_label": "Canon PowerShot SX40 HS",
+                "simulated": True,
+                "sequence": 0,
+                "timestamp": {"clock_domain": "source_monotonic", "value_ns": 1234},
+                "readings": [
+                    {"metric": "chdkptp_payload_fetch_fps", "value": 31.64,
+                     "unit": "completed CHDKPTP payload fetches/s", "availability": "available",
+                     "kind": "derived", "provenance": "Mock fetch rate."},
+                    {"metric": "chdkptp_fetch_call_duration_ms", "value": 29.9,
+                     "unit": "ms/fetch call", "availability": "available",
+                     "kind": "observed", "provenance": "Mock CHDKPTP call duration."},
+                ],
+            }
+            parsed = parse_message(message, time.monotonic_ns())
+            consumer._sources[parsed.source.key] = parsed.source
+            consumer.telemetry_buffer.append(parsed.sample)
+            consumer._set_state(ConsumerState.CONNECTED)
+            self.workspace._poll_canon()
+            APP.processEvents()
+            self.assertIn("SIMULATED", self.workspace.banner.text())
+            self.assertIn("31.6", self.workspace.metric_values["main_rate"].text())
+            self.assertIn("29.90", self.workspace.metric_values["duration"].text())
+            self.assertIn("GUI presentation", self.workspace.metric_values["preview"].text())
+            self.assertGreaterEqual(len(self.workspace.rate_plot.plotItem.listDataItems()), 3)
+            self.assertIn("clock unsynchronized", self.workspace.status_detail.text())
+            self.assertIn("not subtracted", self.workspace.status_detail.toolTip())
+            self.assertIn("Canon PowerShot SX40 HS", self.workspace.source_combo.itemData(
+                0, Qt.ItemDataRole.ToolTipRole
+            ))
+            self.assertEqual(self.workspace.source_combo.minimumContentsLength(), 22)
+            self.assertEqual(len(self.workspace._canon_times), 1)
+            self.assertEqual(len(self.workspace._canon_curves), 8)
+
+            from dataclasses import replace
+            stale_sample = replace(
+                parsed.sample,
+                received_timestamp_ns=time.monotonic_ns() - 2_000_000_000,
+            )
+            consumer.telemetry_buffer.append(stale_sample)
+            self.workspace._poll_canon()
+            APP.processEvents()
+            self.assertIn("selected source stale", self.workspace.metric_values["state"].text())
+            self.assertIn("source stale", self.workspace.status_detail.text())
+            self.assertIn("arrived 2.0 s ago", self.workspace.status_detail.toolTip())
+            self.assertIn("Producer connected", self.workspace.bridge_status.text())
+
+    def test_canon_listener_controls_remain_reachable_at_desktop_widths(self) -> None:
+        self.workspace = PerformanceMonitorWorkspace()
+        self.workspace.mode_combo.setCurrentIndex(2)
+        self.workspace.show()
+        for width, height in ((1024, 768), (1366, 768), (1920, 1080)):
+            self.workspace.resize(width, height)
+            APP.processEvents()
+            self.assertEqual(self.workspace.width(), width)
+            self.assertTrue(self.workspace.listen_button.isVisible())
+            self.assertTrue(self.workspace.bridge_status.isVisible())
+            self.assertLessEqual(self.workspace.canon_controls.width(), width)
+            self.assertGreaterEqual(self.workspace.listen_button.width(), 120)
+
+
+    def test_canon_time_range_is_display_only_and_reconnect_gap_breaks_plot_line(self) -> None:
+        from camera_exploration_lab.canon_telemetry_ipc import (
+            PROTOCOL_NAME, PROTOCOL_VERSION, CanonTelemetryConsumer, parse_message,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="cel-canon-range-") as temporary:
+            consumer = CanonTelemetryConsumer(Path(temporary) / "canon.sock", stale_after_s=1.0)
+            self.workspace = PerformanceMonitorWorkspace(canon_consumer=consumer)
+            self.workspace.mode_combo.setCurrentIndex(2)
+            source_key = "canon-chdkptp:mock:camera"
+            payloads = ((100_000_000_000, 20.0), (145_000_000_000, 24.0))
+            for sequence, (host_ns, rate) in enumerate(payloads):
+                message = {
+                    "protocol": PROTOCOL_NAME, "version": PROTOCOL_VERSION,
+                    "type": "measurement", "producer_id": "mock", "camera_id": "camera",
+                    "camera_label": "Synthetic Canon", "simulated": True,
+                    "sequence": sequence,
+                    "timestamp": {"clock_domain": "source_elapsed", "elapsed_s": sequence + 1.0},
+                    "readings": [{
+                        "metric": "chdkptp_payload_fetch_fps", "value": rate,
+                        "unit": "completed CHDKPTP payload fetches/s", "availability": "available",
+                        "kind": "derived", "provenance": "Synthetic range test rate.",
+                    }],
+                }
+                parsed = parse_message(message, host_ns)
+                consumer._sources[parsed.source.key] = parsed.source
+                consumer.telemetry_buffer.append(parsed.sample)
+            # Source discovery selects this synthetic producer and the UI drains its bounded ring.
+            self.workspace._refresh_canon_sources(force=True)
+            self.workspace._poll_canon()
+            self.assertEqual(len(self.workspace._canon_times), 3)  # two samples plus one NaN break
+            self.assertEqual(self.workspace._canon_times[0], 0.0)
+            self.assertEqual(self.workspace._canon_times[-1], 45.0)
+            self.assertEqual(self.workspace._canon_fetch_rates[0], 20.0)
+            self.assertTrue(self.workspace._canon_fetch_rates[1] != self.workspace._canon_fetch_rates[1])
+            self.assertEqual(self.workspace._canon_fetch_rates[2], 24.0)
+
+            x_before = tuple(self.workspace._canon_times)
+            y_before = tuple(self.workspace._canon_fetch_rates)
+            self.workspace.canon_window_combo.setCurrentIndex(0)  # last 30 seconds
+            APP.processEvents()
+            left, right = self.workspace.rate_plot.getViewBox().viewRange()[0]
+            self.assertAlmostEqual(left, 15.0)
+            self.assertAlmostEqual(right, 45.0)
+            self.assertEqual(tuple(self.workspace._canon_times), x_before)
+            self.assertEqual(tuple(self.workspace._canon_fetch_rates), y_before)
+
+            self.workspace.canon_window_combo.setCurrentIndex(2)  # full retained session
+            APP.processEvents()
+            left, right = self.workspace.rate_plot.getViewBox().viewRange()[0]
+            self.assertAlmostEqual(left, 0.0)
+            self.assertAlmostEqual(right, 45.0)
+
+    def test_monitor_renders_at_desktop_sizes_and_legends_do_not_cover_data(self) -> None:
+        self.workspace = PerformanceMonitorWorkspace()
+        self.workspace.mode_combo.setCurrentIndex(2)
+        self.workspace.show()
+        for width, height in ((1024, 768), (1366, 768), (1920, 1080)):
+            self.workspace.resize(width, height)
+            APP.processEvents()
+            rendered = self.workspace.grab()
+            self.assertFalse(rendered.isNull())
+            self.assertEqual(rendered.size().width(), width)
+            self.assertEqual(rendered.size().height(), height)
+
+        for plot in (self.workspace.rate_plot, self.workspace.duration_plot, self.workspace.activity_plot):
+            legend = plot.plotItem.legend
+            self.assertIsNotNone(legend)
+            self.assertFalse(
+                legend.sceneBoundingRect().intersects(plot.plotItem.vb.sceneBoundingRect()),
+                f"legend overlaps plotted data in {plot.plotItem.titleLabel.text}",
+            )
 
     def test_live_mode_reads_existing_worker_ring_without_starting_a_capture(self) -> None:
         calls: list[str] = []

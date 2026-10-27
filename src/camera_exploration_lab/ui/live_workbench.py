@@ -759,6 +759,7 @@ class LiveWorkbenchWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override name
         self._poll_timer.stop()
         self._discovery_timer.stop()
+        self.performance_monitor.shutdown()
         unfinished = self.multi_camera_workspace.shutdown(timeout_seconds=0.75)
         if unfinished:
             logger.warning("Multi-camera workers still finishing during shutdown: %s", ", ".join(unfinished))

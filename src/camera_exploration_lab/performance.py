@@ -26,6 +26,7 @@ class Metric(StrEnum):
     GUI_PRESENTATION_FPS = "gui_presentation_fps"
     SENSOR_EXPOSURE_FPS = "sensor_exposure_fps"
     CHDKPTP_FETCH_DURATION_MS = "chdkptp_fetch_call_duration_ms"
+    HOST_TELEMETRY_RECEIVE_GAP_MS = "host_telemetry_receive_gap_ms"
     OPENCV_READ_CALL_DURATION_MS = "opencv_read_call_duration_ms"
     FRAME_INTERVAL_MS = "host_read_return_interval_ms"
     SOFTWARE_SKIPS = "software_skips"
@@ -59,6 +60,7 @@ class MeasurementKind(StrEnum):
 
 class ClockDomain(StrEnum):
     HOST_MONOTONIC = "host_monotonic"
+    SOURCE_MONOTONIC = "source_monotonic"
     SOURCE_ELAPSED = "source_elapsed"
 
 
@@ -74,6 +76,7 @@ _UNITS: dict[Metric, str] = {
     Metric.GUI_PRESENTATION_FPS: "physical display presentations/s",
     Metric.SENSOR_EXPOSURE_FPS: "sensor exposures/s",
     Metric.CHDKPTP_FETCH_DURATION_MS: "ms/fetch call",
+    Metric.HOST_TELEMETRY_RECEIVE_GAP_MS: "ms between telemetry message receipts",
     Metric.OPENCV_READ_CALL_DURATION_MS: "ms/OpenCV read call",
     Metric.FRAME_INTERVAL_MS: "ms between successful host read returns",
     Metric.SOFTWARE_SKIPS: "count per recorded sample",
@@ -174,6 +177,7 @@ class TelemetrySample:
     readings: tuple[Measurement, ...]
     sequence: int | None = None
     source_elapsed_s: float | None = None
+    received_timestamp_ns: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.timestamp_ns, bool) or not isinstance(self.timestamp_ns, int) or self.timestamp_ns < 0:
@@ -200,6 +204,12 @@ class TelemetrySample:
             or self.source_elapsed_s < 0
         ):
             raise ValueError("source elapsed time must be finite and non-negative")
+        if self.received_timestamp_ns is not None and (
+            isinstance(self.received_timestamp_ns, bool)
+            or not isinstance(self.received_timestamp_ns, int)
+            or self.received_timestamp_ns < 0
+        ):
+            raise ValueError("received_timestamp_ns must be a non-negative integer")
 
     def get(self, metric: Metric) -> Measurement | None:
         return next((item for item in self.readings if item.metric == metric), None)

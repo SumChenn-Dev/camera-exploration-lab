@@ -1,4 +1,4 @@
-"""Historical Canon replay and read-only live CEL capture telemetry view."""
+"""Historical Canon replay and read-only live CEL/CHDKPTP telemetry view."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..capture import OpenCVCaptureWorker
+from ..canon_telemetry_ipc import CanonSource, CanonTelemetryConsumer, ConsumerState
 from ..performance import Availability, Metric, TelemetrySample
 from ..replay import ReplayController, ReplayDataset, load_builtin_replays
 
@@ -65,9 +66,15 @@ def _display_value(sample: TelemetrySample, metric: Metric, decimals: int = 1) -
 class PerformanceMonitorWorkspace(QWidget):
     """Low-rate UI polling over a bounded worker ring; no per-frame Qt signals."""
 
-    def __init__(self, *, source_provider: SourceProvider | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        source_provider: SourceProvider | None = None,
+        canon_consumer: CanonTelemetryConsumer | None = None,
+    ) -> None:
         super().__init__()
         self._source_provider = source_provider or (lambda: ())
+        self._canon_consumer = canon_consumer or CanonTelemetryConsumer()
         self._datasets: tuple[ReplayDataset, ...] = ()
         self._controller: ReplayController | None = None
         self._live_sources: dict[str, LiveCaptureSource] = {}
@@ -84,6 +91,22 @@ class PerformanceMonitorWorkspace(QWidget):
         self._latest_live_sample: TelemetrySample | None = None
         self._plot_mode: str | None = None
         self._live_curves: tuple[pg.PlotDataItem, pg.PlotDataItem, pg.PlotDataItem, pg.PlotDataItem] | None = None
+        self._canon_source_key: str | None = None
+        self._canon_fingerprint: tuple[tuple[str, str, bool], ...] = ()
+        self._canon_cursor: int | None = None
+        self._canon_origin_ns: int | None = None
+        self._canon_last_host_ns: int | None = None
+        self._canon_times: deque[float] = deque(maxlen=4096)
+        self._canon_fetch_rates: deque[float] = deque(maxlen=4096)
+        self._canon_reported_rates: deque[float] = deque(maxlen=4096)
+        self._canon_content_rates: deque[float] = deque(maxlen=4096)
+        self._canon_fetch_durations: deque[float] = deque(maxlen=4096)
+        self._canon_receive_gaps: deque[float] = deque(maxlen=4096)
+        self._canon_skips: deque[float] = deque(maxlen=4096)
+        self._canon_polls: deque[float] = deque(maxlen=4096)
+        self._canon_device_checks: deque[float] = deque(maxlen=4096)
+        self._latest_canon_sample: TelemetrySample | None = None
+        self._canon_curves: tuple[pg.PlotDataItem, ...] | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 14)
@@ -97,6 +120,7 @@ class PerformanceMonitorWorkspace(QWidget):
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Historical Replay", "replay")
         self.mode_combo.addItem("Live CEL Capture", "live")
+        self.mode_combo.addItem("Live Canon CHDKPTP", "canon")
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         mode_row.addWidget(self.mode_combo)
         self.banner = QLabel()
@@ -109,6 +133,9 @@ class PerformanceMonitorWorkspace(QWidget):
         self.dataset_combo = QComboBox()
         self.dataset_combo.currentIndexChanged.connect(self._dataset_changed)
         self.source_combo = QComboBox()
+        self.source_combo.setMinimumContentsLength(22)
+        self.source_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.source_combo.setToolTip("Selected capture or telemetry source; hover a source for its full label.")
         self.source_combo.currentIndexChanged.connect(self._live_source_changed)
         self.play_button = QPushButton("Play")
         self.pause_button = QPushButton("Pause")
@@ -124,6 +151,32 @@ class PerformanceMonitorWorkspace(QWidget):
             control_row.addWidget(widget)
         control_row.addStretch(1)
         root.addLayout(control_row)
+
+        self.canon_controls = QWidget()
+        canon_control_layout = QHBoxLayout(self.canon_controls)
+        canon_control_layout.setContentsMargins(0, 0, 0, 0)
+        self.listen_button = QPushButton("Listen for CHDKPTP")
+        self.listen_button.clicked.connect(self._toggle_canon_listener)
+        self.socket_path_label = QLabel("Local AF_UNIX endpoint")
+        self.socket_path_label.setToolTip(f"Local socket path: {self._canon_consumer.socket_path}")
+        self.socket_path_label.setStyleSheet("color: palette(text);")
+        self.canon_window_combo = QComboBox()
+        self.canon_window_combo.addItem("Last 30 seconds", 30)
+        self.canon_window_combo.addItem("Last 60 seconds", 60)
+        self.canon_window_combo.addItem("Full session", None)
+        self.canon_window_combo.setCurrentIndex(1)
+        self.canon_window_combo.setToolTip(
+            "Changes only the visible chart range. Retained host-receipt samples and full-session gaps are preserved."
+        )
+        self.canon_window_combo.currentIndexChanged.connect(self._update_canon_plots)
+        self.bridge_status = QLabel("Listener stopped")
+        self.bridge_status.setStyleSheet("color: palette(text); font-weight: 600;")
+        canon_control_layout.addWidget(self.listen_button)
+        canon_control_layout.addWidget(self.socket_path_label, 1)
+        canon_control_layout.addWidget(QLabel("Chart range"))
+        canon_control_layout.addWidget(self.canon_window_combo)
+        canon_control_layout.addWidget(self.bridge_status)
+        root.addWidget(self.canon_controls)
 
         self.metric_group = QGroupBox("Current sample")
         self.metric_grid = QGridLayout(self.metric_group)
@@ -176,6 +229,7 @@ class PerformanceMonitorWorkspace(QWidget):
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
+        self.canon_controls.hide()
 
     @staticmethod
     def _metric_definitions() -> tuple[tuple[str, str, str], ...]:
@@ -198,7 +252,7 @@ class PerformanceMonitorWorkspace(QWidget):
     def _new_plot(title: str, y_label: str) -> pg.PlotWidget:
         plot = pg.PlotWidget()
         plot.setBackground(None)
-        plot.setMinimumHeight(170)
+        plot.setMinimumHeight(190)
         plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         plot.showGrid(x=True, y=True, alpha=0.25)
         plot.setTitle(title)
@@ -206,8 +260,17 @@ class PerformanceMonitorWorkspace(QWidget):
         plot.setLabel("left", y_label)
         for axis_name in ("bottom", "left"):
             plot.getAxis(axis_name).enableAutoSIPrefix(False)
-        plot.addLegend(offset=(10, 8))
+        PerformanceMonitorWorkspace._place_legend_below_plot(plot)
         return plot
+
+    @staticmethod
+    def _place_legend_below_plot(plot: pg.PlotWidget) -> None:
+        """Keep legend labels in their own layout row, outside plotted data."""
+        legend = plot.plotItem.legend
+        if legend is None:
+            legend = plot.addLegend(offset=(0, 0), colCount=2)
+        legend.setParentItem(plot.plotItem)
+        plot.plotItem.layout.addItem(legend, 4, 1)
 
     def _load_catalog(self) -> None:
         try:
@@ -230,21 +293,37 @@ class PerformanceMonitorWorkspace(QWidget):
 
     def _set_mode(self, mode: str) -> None:
         historical = mode == "replay"
+        canon = mode == "canon"
         self.dataset_combo.setVisible(historical)
         self.play_button.setVisible(historical)
         self.pause_button.setVisible(historical)
         self.reset_button.setVisible(historical)
         self.replay_position.setVisible(historical)
         self.source_combo.setVisible(not historical)
-        self.metric_group.setTitle("Current historical sample" if historical else "Current live capture snapshot")
+        self.canon_controls.setVisible(canon)
+        self.metric_group.setTitle(
+            "Current historical sample" if historical else
+            "Current Canon CHDKPTP telemetry sample" if canon else
+            "Current live CEL capture snapshot"
+        )
         if historical:
+            self.metric_labels["main_rate"].setText("Measured rate")
+            self.metric_labels["duration"].setText("Host call duration (ms)")
             self._build_historical_plots()
             self.banner.setText(
                 "HISTORICAL REPLAY · published Canon CSV measurements · no camera connection. "
                 "Rows are played in CSV order; stage-local elapsed values are concatenated only for replay scheduling."
             )
             self._show_current_replay()
+        elif canon:
+            self.metric_labels["main_rate"].setText("Payload fetch rate / reported FPS")
+            self.metric_labels["duration"].setText("CHDKPTP fetch-call duration (ms)")
+            self._refresh_canon_sources(force=True)
+            self._prepare_canon_plots()
+            self._poll_canon()
         else:
+            self.metric_labels["main_rate"].setText("Successful OpenCV reads/s")
+            self.metric_labels["duration"].setText("OpenCV read() duration (ms)")
             self.banner.setText(
                 "LIVE CEL CAPTURE · reads existing capture-worker telemetry rings; this tab never opens a camera. "
                 "GUI preview updates are separate from capture and are not physical display presentations."
@@ -258,6 +337,8 @@ class PerformanceMonitorWorkspace(QWidget):
         self._controller = ReplayController(self._datasets[index])
         self._build_historical_plots()
         self.play_button.setText("Play")
+        self.play_button.setEnabled(True)
+        self.pause_button.setEnabled(False)
         self._show_current_replay()
 
     def _dataset(self) -> ReplayDataset | None:
@@ -340,7 +421,7 @@ class PerformanceMonitorWorkspace(QWidget):
             (self.activity_plot, "Recorded activity counts", "Count per sample / reported counter"),
         ):
             plot.clear()
-            plot.addLegend(offset=(10, 8))
+            self._place_legend_below_plot(plot)
             plot.showGrid(x=True, y=True, alpha=0.25)
             plot.setTitle(title)
             plot.setLabel("left", ylabel)
@@ -478,13 +559,17 @@ class PerformanceMonitorWorkspace(QWidget):
             self.metric_values[key].setText(value)
 
     def _tick(self) -> None:
-        if self.mode_combo.currentData() == "replay":
+        mode = self.mode_combo.currentData()
+        if mode == "replay":
             if self._controller is not None and self._controller.playing:
                 self._controller.advance(time.monotonic_ns())
                 self._show_current_replay()
                 if not self._controller.playing:
                     self.play_button.setText("Play")
                     self.play_button.setEnabled(True)
+            return
+        if mode == "canon":
+            self._poll_canon()
             return
         self._poll_live()
 
@@ -504,7 +589,9 @@ class PerformanceMonitorWorkspace(QWidget):
         self._live_sources = {}
         for source in sources:
             self._live_sources[source.key] = source
+            row = self.source_combo.count()
             self.source_combo.addItem(source.label, source.key)
+            self.source_combo.setItemData(row, source.label, Qt.ItemDataRole.ToolTipRole)
         index = self.source_combo.findData(previous)
         if index < 0 and self.source_combo.count():
             index = 0
@@ -523,7 +610,10 @@ class PerformanceMonitorWorkspace(QWidget):
     def _live_source_changed(self, _index: int) -> None:
         self._live_source_key = str(self.source_combo.currentData()) if self.source_combo.currentData() else None
         self._reset_live_history()
+        self._canon_source_key = self._live_source_key
+        self._reset_canon_history()
         self._clear_live_plot_data()
+        self._clear_canon_plot_data()
 
     def _reset_live_history(self) -> None:
         self._live_cursor = None
@@ -532,6 +622,273 @@ class PerformanceMonitorWorkspace(QWidget):
         for values in (self._live_times, self._live_capture_rates, self._live_intervals,
                        self._live_read_durations, self._preview_times, self._preview_rates):
             values.clear()
+
+    def _reset_canon_history(self) -> None:
+        self._canon_cursor = None
+        self._canon_origin_ns = None
+        self._canon_last_host_ns = None
+        self._latest_canon_sample = None
+        for values in (
+            self._canon_times, self._canon_fetch_rates, self._canon_reported_rates,
+            self._canon_content_rates, self._canon_fetch_durations,
+            self._canon_receive_gaps, self._canon_skips, self._canon_polls,
+            self._canon_device_checks,
+        ):
+            values.clear()
+
+    def _toggle_canon_listener(self) -> None:
+        state = self._canon_consumer.snapshot().state
+        if state in (ConsumerState.STOPPED, ConsumerState.ERROR):
+            try:
+                self._canon_consumer.start()
+                self.bridge_status.setText("Starting listener…")
+            except Exception as exc:
+                self.bridge_status.setText(f"Listener could not start: {exc}")
+        else:
+            self._canon_consumer.request_stop()
+            self.bridge_status.setText("Stopping listener…")
+
+    def _refresh_canon_sources(self, *, force: bool = False) -> None:
+        sources = self._canon_consumer.sources
+        fingerprint = tuple((source.key, source.label, source.simulated) for source in sources)
+        if not force and fingerprint == self._canon_fingerprint:
+            return
+        previous = self._canon_source_key or str(self.source_combo.currentData() or "")
+        blocker = QSignalBlocker(self.source_combo)
+        self.source_combo.clear()
+        for source in sources:
+            suffix = " · SIMULATED" if source.simulated else ""
+            row = self.source_combo.count()
+            label = f"{source.label}{suffix}"
+            self.source_combo.addItem(label, source.key)
+            self.source_combo.setItemData(row, label, Qt.ItemDataRole.ToolTipRole)
+        index = self.source_combo.findData(previous)
+        if index < 0 and self.source_combo.count():
+            index = 0
+        if index >= 0:
+            self.source_combo.setCurrentIndex(index)
+            self._canon_source_key = str(self.source_combo.currentData())
+            self._live_source_key = self._canon_source_key
+        else:
+            self._canon_source_key = None
+            self._live_source_key = None
+        del blocker
+        self.source_combo.setEnabled(bool(sources))
+        self.source_combo.setToolTip(
+            self.source_combo.currentText() or "Waiting for a CHDKPTP telemetry producer."
+        )
+        self._canon_fingerprint = fingerprint
+        self._reset_canon_history()
+        if self.mode_combo.currentData() == "canon":
+            self._prepare_canon_plots()
+
+    def _poll_canon(self) -> None:
+        self._refresh_canon_sources()
+        snapshot = self._canon_consumer.snapshot()
+        self.bridge_status.setText(self._canon_state_label(snapshot.state))
+        self.listen_button.setText(
+            "Stop Listener" if snapshot.state not in (ConsumerState.STOPPED, ConsumerState.ERROR) else "Listen for CHDKPTP"
+        )
+        self.listen_button.setEnabled(snapshot.state != ConsumerState.STARTING)
+        read = self._canon_consumer.telemetry_buffer.read_since(self._canon_cursor)
+        self._canon_cursor = read.next_cursor
+        selected = self._canon_source_key
+        for _ring_sequence, sample in read.entries:
+            if sample.source != selected:
+                continue
+            host_time = sample.received_timestamp_ns
+            if host_time is None:
+                continue
+            if self._canon_origin_ns is None:
+                self._canon_origin_ns = host_time
+            elapsed_s = (host_time - self._canon_origin_ns) / 1_000_000_000
+            if (
+                self._canon_last_host_ns is not None
+                and host_time - self._canon_last_host_ns >= self._canon_consumer.stale_after_ns
+            ):
+                # A NaN vertex breaks the plotted segment across a producer gap.
+                # It preserves the full host-receipt timeline without inventing continuity.
+                self._canon_times.append(elapsed_s)
+                for series in (
+                    self._canon_fetch_rates, self._canon_reported_rates,
+                    self._canon_content_rates, self._canon_fetch_durations,
+                    self._canon_receive_gaps, self._canon_skips,
+                    self._canon_polls, self._canon_device_checks,
+                ):
+                    series.append(nan)
+            self._canon_last_host_ns = host_time
+            self._latest_canon_sample = sample
+            self._canon_times.append(elapsed_s)
+            self._canon_fetch_rates.append(self._number_value(sample, Metric.CHDKPTP_FETCH_FPS))
+            self._canon_reported_rates.append(self._number_value(sample, Metric.CHDKPTP_GUI_REPORTED_FPS))
+            self._canon_content_rates.append(self._number_value(sample, Metric.CONTENT_CHANGE_RATE))
+            self._canon_fetch_durations.append(self._number_value(sample, Metric.CHDKPTP_FETCH_DURATION_MS))
+            self._canon_receive_gaps.append(self._number_value(sample, Metric.HOST_TELEMETRY_RECEIVE_GAP_MS))
+            self._canon_skips.append(self._number_value(sample, Metric.SOFTWARE_SKIPS))
+            self._canon_polls.append(self._number_value(sample, Metric.CHDKPTP_POLL_ATTEMPTS))
+            self._canon_device_checks.append(self._number_value(sample, Metric.DEVICE_POLL_CHECKS))
+        self._update_canon_plots()
+        source = next((item for item in self._canon_consumer.sources if item.key == selected), None)
+        selected_sample_age_s = None
+        if self._latest_canon_sample is None:
+            unavailable = "Unavailable · no sample received"
+            self._set_values({
+                "requested": unavailable, "main_rate": unavailable, "content": unavailable,
+                "content_samples": unavailable, "exact_repeats": unavailable,
+                "duration": unavailable, "throughput": unavailable, "usb_speed": unavailable,
+                "preview": "Unavailable · CHDKPTP producer does not measure CEL presentation",
+                "skips": unavailable, "polls": unavailable,
+                "state": "Waiting for source" if source is None else "Waiting for first sample",
+            })
+        else:
+            sample = self._latest_canon_sample
+            state_reading = sample.get(Metric.CONNECTION_STATE)
+            camera_state = (
+                str(state_reading.value)
+                if state_reading and state_reading.availability == Availability.AVAILABLE
+                else None
+            )
+            state_text = self._canon_state_label(snapshot.state)
+            if sample.received_timestamp_ns is not None:
+                selected_sample_age_s = max(0, time.monotonic_ns() - sample.received_timestamp_ns) / 1_000_000_000
+                if selected_sample_age_s * 1_000_000_000 >= self._canon_consumer.stale_after_ns:
+                    state_text += " · selected source stale"
+            if camera_state:
+                state_text += f" · last camera state: {camera_state}"
+            self._set_values({
+                "requested": _display_value(sample, Metric.REQUESTED_FPS),
+                "main_rate": self._preferred_canon_rate(sample),
+                "content": _display_value(sample, Metric.CONTENT_CHANGE_RATE),
+                "content_samples": _display_value(sample, Metric.CONTENT_SAMPLE_COUNT),
+                "exact_repeats": _display_value(sample, Metric.EXACT_REPEAT_COUNT),
+                "duration": _display_value(sample, Metric.CHDKPTP_FETCH_DURATION_MS, 2),
+                "throughput": _display_value(sample, Metric.CHDKPTP_REPORTED_THROUGHPUT_KBPS, 2),
+                "usb_speed": _display_value(sample, Metric.CHDKPTP_REPORTED_USB_SPEED_KBPS, 2),
+                "preview": "Unavailable · producer does not measure CEL GUI presentation",
+                "skips": self._skip_label(sample),
+                "polls": self._poll_label(sample),
+                "state": state_text,
+            })
+        simulation_text = "SIMULATED source" if source and source.simulated else "CHDKPTP source"
+        warnings = (
+            f"Rejected messages: {snapshot.rejected_messages}; oversized: {snapshot.oversized_messages}; "
+            f"sequence gaps: {snapshot.sequence_gaps}; ring overwrites: {snapshot.ring_overwrites}."
+        )
+        source_clock = (
+            self._latest_canon_sample.clock_domain.value
+            if self._latest_canon_sample else "producer"
+        )
+        details = (
+            f"{simulation_text}. Source timestamps use {source_clock}; charts use CEL host-monotonic receipt time. "
+            "Producer and CEL clocks are not subtracted. CHDKPTP fetch-call duration is producer-reported; "
+            "IPC receive gaps are arrival spacing, not camera transfer latency. "
+            f"{warnings}"
+        )
+        if snapshot.state != ConsumerState.CONNECTED:
+            details += " Displayed metric values are the last valid sample; transport is not currently receiving."
+        if selected_sample_age_s is not None and selected_sample_age_s * 1_000_000_000 >= self._canon_consumer.stale_after_ns:
+            details += f" Selected source is stale; its last valid sample arrived {selected_sample_age_s:.1f} s ago."
+        if read.missed_entries:
+            details += f" The UI ring cursor missed {read.missed_entries} retained sample(s)."
+        if snapshot.error:
+            details += f" {snapshot.error}"
+        visible = (
+            f"{simulation_text} · source clock unsynchronized · receipt-time chart · "
+            f"rejected {snapshot.rejected_messages}, oversized {snapshot.oversized_messages}, "
+            f"gaps {snapshot.sequence_gaps}, overwrites {snapshot.ring_overwrites}"
+        )
+        if selected_sample_age_s is not None and selected_sample_age_s * 1_000_000_000 >= self._canon_consumer.stale_after_ns:
+            visible += " · source stale"
+        if snapshot.error:
+            visible += " · listener error"
+        self.status_detail.setText(visible)
+        self.status_detail.setToolTip(details)
+        label = source.label if source else "waiting for producer"
+        self.banner.setText(
+            f"LIVE CANON CHDKPTP · {simulation_text.upper()} · {label} · local telemetry only; CEL does not open USB/PTP."
+        )
+
+    @staticmethod
+    def _canon_state_label(state: ConsumerState) -> str:
+        return {
+            ConsumerState.STOPPED: "Listener stopped",
+            ConsumerState.STARTING: "Listener starting",
+            ConsumerState.LISTENING: "Listening · waiting for producer",
+            ConsumerState.CONNECTED: "Producer connected",
+            ConsumerState.STALE: "Stale · no recent telemetry",
+            ConsumerState.ERROR: "Listener error",
+        }[state]
+
+    @staticmethod
+    def _preferred_canon_rate(sample: TelemetrySample) -> str:
+        fetch = sample.get(Metric.CHDKPTP_FETCH_FPS)
+        if fetch and fetch.availability == Availability.AVAILABLE:
+            return f"{fetch.value:.1f} · completed payload fetches/s"
+        reported = sample.get(Metric.CHDKPTP_GUI_REPORTED_FPS)
+        if reported and reported.availability == Availability.AVAILABLE:
+            return f"{reported.value:.1f} · CHDKPTP-reported FPS"
+        return "Unavailable / not recorded"
+
+    def _update_canon_plots(self) -> None:
+        if self._plot_mode != "canon" or self._canon_curves is None:
+            self._prepare_canon_plots()
+        assert self._canon_curves is not None
+        fetch, reported, content, duration, receive_gap, skips, polls, device_checks = self._canon_curves
+        x = list(self._canon_times)
+        for curve, values in (
+            (fetch, self._canon_fetch_rates), (reported, self._canon_reported_rates),
+            (content, self._canon_content_rates), (duration, self._canon_fetch_durations),
+            (receive_gap, self._canon_receive_gaps), (skips, self._canon_skips),
+            (polls, self._canon_polls), (device_checks, self._canon_device_checks),
+        ):
+            curve.setData(x, list(values))
+        if x:
+            right = x[-1]
+            window = self.canon_window_combo.currentData()
+            left = x[0] if window is None else max(x[0], right - float(window))
+            if right <= left:
+                right = left + 1.0
+            for plot in (self.rate_plot, self.duration_plot, self.activity_plot):
+                plot.setXRange(left, right, padding=0)
+
+    def _prepare_canon_plots(self) -> None:
+        if self._plot_mode == "canon" and self._canon_curves is not None:
+            self._clear_canon_plot_data()
+            return
+        self._clear_plots()
+        self.activity_plot.show()
+        self.activity_empty_label.hide()
+        self._plot_mode = "canon"
+        for plot in (self.rate_plot, self.duration_plot, self.activity_plot):
+            plot.setLabel("bottom", "Seconds since first CEL host receipt")
+        self.rate_plot.setTitle("Canon CHDKPTP measurements · source rates are not sensor FPS")
+        self.duration_plot.setTitle("Producer fetch-call duration and CEL IPC arrival gap")
+        self.activity_plot.setTitle("CHDKPTP polling and software-skip counters")
+        curves = (
+            self.rate_plot.plot([], [], pen=pg.mkPen("#4da3ff", width=1.6), name="Completed payload fetches/s"),
+            self.rate_plot.plot([], [], pen=pg.mkPen("#58c486", width=1.6), name="CHDKPTP-reported FPS"),
+            self.rate_plot.plot([], [], pen=pg.mkPen("#d675d0", width=1.6), name="Content changes/s (estimate)"),
+            self.duration_plot.plot([], [], pen=pg.mkPen("#f2a65a", width=1.6), name="CHDKPTP fetch-call duration (ms)"),
+            self.duration_plot.plot([], [], pen=pg.mkPen("#e0d66c", width=1.6), name="CEL IPC receive gap (ms)"),
+            self.activity_plot.plot([], [], pen=pg.mkPen("#d675d0", width=1.6), name="Software skips"),
+            self.activity_plot.plot([], [], pen=pg.mkPen("#4da3ff", width=1.6), name="CHDKPTP poll attempts"),
+            self.activity_plot.plot([], [], pen=pg.mkPen("#58c486", width=1.6), name="Device-list checks"),
+        )
+        self._canon_curves = curves
+        self._apply_plot_palette()
+
+    def _clear_canon_plot_data(self) -> None:
+        if self._canon_curves is not None:
+            for curve in self._canon_curves:
+                curve.setData([], [])
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self.shutdown()
+        super().closeEvent(event)
+
+    def shutdown(self) -> None:
+        """Request the listener to stop without joining from the GUI thread."""
+        self._canon_consumer.shutdown()
 
     def _poll_live(self) -> None:
         self._refresh_live_sources()
